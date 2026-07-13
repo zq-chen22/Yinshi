@@ -36,6 +36,7 @@ class Binding:
     cwd: str
     chat_id: str | None = None
     app_role: AppRole = "conversation"
+    thread_created_at: int = 0
     thread_updated_at: int = 0
     last_synced_turn_id: str | None = None
     last_synced_message_hash: str | None = None

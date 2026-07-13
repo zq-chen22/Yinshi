@@ -7,6 +7,7 @@ import multiprocessing
 import os
 import re
 import secrets
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
@@ -25,6 +26,8 @@ from lark_oapi.api.im.v1 import (
     ListChatRequest,
     PatchMessageRequest,
     PatchMessageRequestBody,
+    UpdateChatRequest,
+    UpdateChatRequestBody,
 )
 from lark_oapi.event.callback.model.p2_card_action_trigger import (
     P2CardActionTrigger,
@@ -52,6 +55,18 @@ def conversation_group_name(title: str, suffix: str) -> str:
     clean = re.sub(r"[\r\n\t]+", " ", title).strip() or "Codex 对话"
     max_title = max(1, 60 - len(suffix))
     return f"{clean[:max_title]}{suffix}"
+
+
+def conversation_group_description(thread_id: str, cwd: str, created_at: int) -> str:
+    clean_cwd = re.sub(r"[\r\n\t]+", " ", cwd).strip() or "未知"
+    timestamp = created_at / 1000 if created_at > 10_000_000_000 else created_at
+    if timestamp > 0:
+        started = datetime.fromtimestamp(timestamp, tz=timezone.utc).astimezone().isoformat(
+            sep=" ", timespec="seconds"
+        )
+    else:
+        started = "未知"
+    return f"目录：{clean_cwd}\n开始：{started}\ncodex-thread:{thread_id}"
 
 
 def progress_card(title: str, text: str, *, color: str = "blue") -> dict[str, Any]:
@@ -222,7 +237,12 @@ class FeishuGateway:
         self._require_success(response, "patch card")
 
     async def create_conversation_chat(
-        self, thread_id: str, title: str, owner_open_id: str
+        self,
+        thread_id: str,
+        title: str,
+        owner_open_id: str,
+        cwd: str,
+        created_at: int,
     ) -> tuple[str, str]:
         if not owner_open_id:
             raise FeishuAPIError("conversation app owner_open_id is not paired")
@@ -230,10 +250,7 @@ class FeishuGateway:
         body = (
             CreateChatRequestBody.builder()
             .name(name)
-            .description(
-                f"因时 Codex 远程对话；稳定绑定标签 codex-thread:{thread_id}。"
-                "请勿邀请其他成员，群名不用于路由。"
-            )
+            .description(conversation_group_description(thread_id, cwd, created_at))
             .owner_id(owner_open_id)
             .user_id_list([owner_open_id])
             .group_message_type("chat")
@@ -259,6 +276,23 @@ class FeishuGateway:
         if not chat_id:
             raise FeishuAPIError("Feishu chat creation succeeded without a chat_id")
         return str(chat_id), name
+
+    async def update_conversation_chat_description(
+        self, chat_id: str, thread_id: str, cwd: str, created_at: int
+    ) -> None:
+        request = (
+            UpdateChatRequest.builder()
+            .user_id_type("open_id")
+            .chat_id(chat_id)
+            .request_body(
+                UpdateChatRequestBody.builder()
+                .description(conversation_group_description(thread_id, cwd, created_at))
+                .build()
+            )
+            .build()
+        )
+        response = await self._client("conversation").im.v1.chat.aupdate(request)
+        self._require_success(response, "update chat description")
 
     async def find_conversation_chat(
         self, thread_id: str, owner_open_id: str

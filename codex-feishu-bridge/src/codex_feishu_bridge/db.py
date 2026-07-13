@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS bindings (
     cwd TEXT NOT NULL,
     chat_id TEXT UNIQUE,
     app_role TEXT NOT NULL DEFAULT 'conversation',
+    thread_created_at INTEGER NOT NULL DEFAULT 0,
     thread_updated_at INTEGER NOT NULL DEFAULT 0,
     last_synced_turn_id TEXT,
     last_synced_message_hash TEXT,
@@ -174,6 +175,14 @@ class BridgeDB:
         self._lock = threading.RLock()
         with self._lock:
             self._conn.executescript(SCHEMA)
+            binding_columns = {
+                str(row[1])
+                for row in self._conn.execute("PRAGMA table_info(bindings)").fetchall()
+            }
+            if "thread_created_at" not in binding_columns:
+                self._conn.execute(
+                    "ALTER TABLE bindings ADD COLUMN thread_created_at INTEGER NOT NULL DEFAULT 0"
+                )
             outbox_columns = {
                 str(row[1])
                 for row in self._conn.execute("PRAGMA table_info(outbox_messages)").fetchall()
@@ -916,17 +925,24 @@ class BridgeDB:
         with self._lock:
             self._conn.execute(
                 """INSERT INTO bindings(
-                       thread_id, title, cwd, thread_updated_at, sync_state, created_at, updated_at
-                   ) VALUES(?, ?, ?, ?, 'pending', ?, ?)
+                       thread_id, title, cwd, thread_created_at, thread_updated_at,
+                       sync_state, created_at, updated_at
+                   ) VALUES(?, ?, ?, ?, ?, 'pending', ?, ?)
                    ON CONFLICT(thread_id) DO UPDATE SET
                        title=bindings.title,
                        cwd=excluded.cwd,
+                       thread_created_at=CASE
+                           WHEN excluded.thread_created_at > 0
+                           THEN excluded.thread_created_at
+                           ELSE bindings.thread_created_at
+                       END,
                        thread_updated_at=MAX(bindings.thread_updated_at, excluded.thread_updated_at),
                        updated_at=excluded.updated_at""",
                 (
                     thread.thread_id,
                     effective_title,
                     thread.cwd,
+                    thread.created_at,
                     thread.updated_at,
                     now,
                     now,
@@ -936,6 +952,32 @@ class BridgeDB:
         binding = self.get_binding_by_thread(thread.thread_id)
         assert binding is not None
         return binding
+
+    def refresh_thread_metadata(self, thread: ThreadSummary) -> Binding | None:
+        """Refresh metadata only for an existing binding without registering a new thread."""
+
+        with self._lock:
+            self._conn.execute(
+                """UPDATE bindings SET
+                       cwd=CASE WHEN ? != '' THEN ? ELSE cwd END,
+                       thread_created_at=CASE
+                           WHEN ? > 0 THEN ? ELSE thread_created_at
+                       END,
+                       thread_updated_at=MAX(thread_updated_at, ?),
+                       updated_at=?
+                   WHERE thread_id=?""",
+                (
+                    thread.cwd,
+                    thread.cwd,
+                    thread.created_at,
+                    thread.created_at,
+                    thread.updated_at,
+                    int(time.time()),
+                    thread.thread_id,
+                ),
+            )
+            self._conn.commit()
+        return self.get_binding_by_thread(thread.thread_id)
 
     def bind_chat(self, thread_id: str, chat_id: str, title: str | None = None) -> None:
         now = int(time.time())
@@ -1070,6 +1112,7 @@ class BridgeDB:
             cwd=row["cwd"],
             chat_id=row["chat_id"],
             app_role=row["app_role"],
+            thread_created_at=row["thread_created_at"],
             thread_updated_at=row["thread_updated_at"],
             last_synced_turn_id=row["last_synced_turn_id"],
             last_synced_message_hash=row["last_synced_message_hash"],

@@ -209,6 +209,7 @@ class FakeGateway:
         self.history: list[IncomingMessage] = []
         self.history_calls: list[dict[str, Any]] = []
         self.downloads: list[tuple[AppRole, Attachment]] = []
+        self.chat_updates: list[dict[str, Any]] = []
 
     def configured(self, role: AppRole) -> bool:
         return role in self.configured_roles
@@ -242,6 +243,33 @@ class FakeGateway:
     ) -> tuple[bytes, str]:
         self.downloads.append((role, attachment))
         return b"staged attachment", attachment.name
+
+    async def find_conversation_chat(
+        self, thread_id: str, owner_open_id: str
+    ) -> tuple[str, str] | None:
+        return None
+
+    async def create_conversation_chat(
+        self,
+        thread_id: str,
+        title: str,
+        owner_open_id: str,
+        cwd: str,
+        created_at: int,
+    ) -> tuple[str, str]:
+        return f"oc-{thread_id}", title
+
+    async def update_conversation_chat_description(
+        self, chat_id: str, thread_id: str, cwd: str, created_at: int
+    ) -> None:
+        self.chat_updates.append(
+            {
+                "chat_id": chat_id,
+                "thread_id": thread_id,
+                "cwd": cwd,
+                "created_at": created_at,
+            }
+        )
 
     async def list_chat_messages(
         self,
@@ -1123,6 +1151,46 @@ async def test_reconcile_never_binds_orphan_from_admin_scratch(tmp_path: Path) -
         bindings = await service.reconcile_once()
         assert [item.thread_id for item in bindings] == ["thread-normal"]
         assert db.get_binding_by_thread("thread-admin-orphan") is None
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_updates_existing_chat_description_once(tmp_path: Path) -> None:
+    config = make_config(
+        tmp_path,
+        owner_conversation_open_id="ou_conversation_owner",
+    )
+    db = BridgeDB(config.database_path)
+    summary = ThreadSummary(
+        thread_id="thread-normal",
+        name="正常对话",
+        preview="",
+        cwd=str(tmp_path / "project"),
+        created_at=1_700_000_000,
+        updated_at=1_700_000_100,
+        source_kind="cli",
+    )
+    db.upsert_thread(summary)
+    db.bind_chat(summary.thread_id, "oc-existing")
+    gateway = FakeGateway(configured_roles={"conversation"})
+    service = BridgeService(
+        config,
+        db,
+        StaticThreadsCodex([summary]),
+        gateway,  # type: ignore[arg-type]
+    )
+    try:
+        await service.reconcile_once()
+        await service.reconcile_once()
+        assert gateway.chat_updates == [
+            {
+                "chat_id": "oc-existing",
+                "thread_id": "thread-normal",
+                "cwd": str(tmp_path / "project"),
+                "created_at": 1_700_000_000,
+            }
+        ]
     finally:
         db.close()
 

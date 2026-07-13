@@ -184,6 +184,11 @@ class BridgeService:
         ]
         recent = threads[: self.config.initial_thread_count]
         bindings = [self.db.upsert_thread(thread) for thread in recent]
+        summaries = {thread.thread_id: thread for thread in threads}
+        for binding in self.db.list_bindings():
+            summary = summaries.get(binding.thread_id)
+            if summary:
+                self.db.refresh_thread_metadata(summary)
         owner = self._owner("conversation")
         if self.gateway.configured("conversation") and owner:
             for binding in self.db.list_bindings(pending_only=True):
@@ -192,6 +197,15 @@ class BridgeService:
                 except Exception as error:
                     LOG.exception("Failed creating Feishu chat for %s", binding.thread_id)
                     self.db.set_binding_error(binding.thread_id, str(error))
+            for binding in self.db.list_bindings():
+                if not binding.chat_id:
+                    continue
+                try:
+                    await self._sync_chat_description(binding)
+                except Exception:
+                    LOG.exception(
+                        "Failed updating Feishu chat description for %s", binding.thread_id
+                    )
         await self._sync_external_updates(threads)
         return [self.db.get_binding_by_thread(item.thread_id) or item for item in bindings]
 
@@ -251,7 +265,11 @@ class BridgeService:
             chat_id, actual_name = recovered
         else:
             chat_id, actual_name = await self.gateway.create_conversation_chat(
-                binding.thread_id, binding.title, owner
+                binding.thread_id,
+                binding.title,
+                owner,
+                binding.cwd,
+                binding.thread_created_at,
             )
         self.db.bind_chat(binding.thread_id, chat_id, actual_name.removesuffix(self.config.group_suffix))
         with contextlib.suppress(Exception):
@@ -272,6 +290,39 @@ class BridgeService:
             ),
             idempotency_key=f"welcome:{binding.thread_id}",
         )
+
+    async def _sync_chat_description(self, binding: Binding) -> None:
+        if not binding.chat_id:
+            return
+        if binding.thread_created_at <= 0:
+            raw = await self.codex.read_thread(binding.thread_id, include_turns=False)
+            summary = ThreadSummary(
+                thread_id=binding.thread_id,
+                name=raw.get("name"),
+                preview=str(raw.get("preview") or ""),
+                cwd=str(raw.get("cwd") or binding.cwd),
+                created_at=int(raw.get("createdAt") or 0),
+                updated_at=int(
+                    raw.get("recencyAt")
+                    or raw.get("updatedAt")
+                    or raw.get("createdAt")
+                    or binding.thread_updated_at
+                ),
+            )
+            binding = self.db.refresh_thread_metadata(summary) or binding
+        signature = hashlib.sha256(
+            f"v2\0{binding.chat_id}\0{binding.cwd}\0{binding.thread_created_at}".encode()
+        ).hexdigest()
+        setting = f"chat_description_hash:{binding.thread_id}"
+        if self.db.get_setting(setting, "") == signature:
+            return
+        await self.gateway.update_conversation_chat_description(
+            binding.chat_id,
+            binding.thread_id,
+            binding.cwd,
+            binding.thread_created_at,
+        )
+        self.db.set_setting(setting, signature)
 
     async def _sync_external_updates(self, recent: list[ThreadSummary]) -> None:
         for thread in recent:
