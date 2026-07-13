@@ -1,0 +1,26 @@
+# Python and test output
+**/.venv/
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+**/*.egg-info/
+
+# Local bridge configuration and credentials
+**/config.toml
+**/secrets.env
+**/credentials.env
+**/.env
+
+# Runtime state and user-delivered artifacts
+**/*.sqlite
+**/*.sqlite-shm
+**/*.sqlite-wal
+**/inbox/
+**/outbox/
+**/service.lock
+
+# Editors and operating systems
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
