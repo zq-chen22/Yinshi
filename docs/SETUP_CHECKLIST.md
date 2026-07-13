@@ -16,6 +16,7 @@
 - [ ] 添加 Bot 能力
 - [ ] 记录 App ID，未将 App Secret 发到聊天或 Git
 - [ ] 添加消息接收、发送、更新、资源和群管理所需权限
+- [ ] 已开通 `im:chat:update`，允许自动维护已有群描述
 - [ ] 事件订阅选择长连接并添加 `im.message.receive_v1`
 - [ ] 回调订阅选择长连接并添加 `card.action.trigger`
 - [ ] 可用范围包含 owner

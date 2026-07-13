@@ -90,6 +90,7 @@ FEISHU_CONVERSATION_APP_SECRET='只在目标机器填写'
 | `im:resource` | 上传和下载图片、文件、媒体 |
 | `im:chat:create` | 为 Codex thread 创建飞书群 |
 | `im:chat:read` | 查找和恢复已创建群 |
+| `im:chat:update` | 把工作目录和对话开始时间写入已有群描述 |
 | `im:chat:operate_as_owner` | 管理机器人创建的群 |
 
 当前桥不需要通讯录、云文档、日历、审批或多维表格权限。若以后新增飞书文档报告能力，应单独设计并只增加对应权限。

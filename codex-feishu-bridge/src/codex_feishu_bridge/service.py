@@ -88,6 +88,7 @@ class BridgeService:
         self.worker_id = f"{uuid.uuid4()}"
         self._stop = asyncio.Event()
         self.fatal_error: BaseException | None = None
+        self._chat_description_retry_at: dict[str, float] = {}
         self._tasks: list[asyncio.Task[Any]] = []
         self._thread_queues: dict[str, asyncio.Queue[ScheduledMessage]] = {}
         self._thread_workers: dict[str, asyncio.Task[None]] = {}
@@ -200,11 +201,17 @@ class BridgeService:
             for binding in self.db.list_bindings():
                 if not binding.chat_id:
                     continue
+                if self._chat_description_retry_at.get(binding.thread_id, 0) > time.time():
+                    continue
                 try:
                     await self._sync_chat_description(binding)
-                except Exception:
-                    LOG.exception(
-                        "Failed updating Feishu chat description for %s", binding.thread_id
+                    self._chat_description_retry_at.pop(binding.thread_id, None)
+                except Exception as error:
+                    self._chat_description_retry_at[binding.thread_id] = time.time() + 300
+                    LOG.warning(
+                        "Failed updating Feishu chat description for %s; retrying in 5 minutes: %s",
+                        binding.thread_id,
+                        error,
                     )
         await self._sync_external_updates(threads)
         return [self.db.get_binding_by_thread(item.thread_id) or item for item in bindings]
