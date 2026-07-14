@@ -52,6 +52,11 @@ class BridgeConfig:
     initial_thread_count: int = 3
     sync_interval_seconds: int = 15
     progress_update_seconds: float = 2.0
+    progress_heartbeat_seconds: float = 30.0
+    progress_stale_seconds: float = 120.0
+    auto_compact_ratio: float = 0.65
+    auto_compact_min_input_tokens: int = 100_000
+    compaction_timeout_seconds: float = 900.0
     group_suffix: str = "-Codex主机"
     auto_discover_new_threads: bool = True
     source_kinds: list[str] = field(
@@ -112,6 +117,17 @@ def load_config(path: str | Path | None = None) -> BridgeConfig:
         initial_thread_count=int(bridge.get("initial_thread_count", 3)),
         sync_interval_seconds=int(bridge.get("sync_interval_seconds", 15)),
         progress_update_seconds=float(bridge.get("progress_update_seconds", 2.0)),
+        progress_heartbeat_seconds=float(
+            bridge.get("progress_heartbeat_seconds", 30.0)
+        ),
+        progress_stale_seconds=float(bridge.get("progress_stale_seconds", 120.0)),
+        auto_compact_ratio=float(bridge.get("auto_compact_ratio", 0.65)),
+        auto_compact_min_input_tokens=int(
+            bridge.get("auto_compact_min_input_tokens", 100_000)
+        ),
+        compaction_timeout_seconds=float(
+            bridge.get("compaction_timeout_seconds", 900.0)
+        ),
         group_suffix=str(bridge.get("group_suffix", "-Codex主机")),
         auto_discover_new_threads=bool(bridge.get("auto_discover_new_threads", True)),
         source_kinds=list(

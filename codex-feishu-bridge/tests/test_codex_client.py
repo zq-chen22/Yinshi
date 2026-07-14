@@ -92,11 +92,32 @@ for raw in sys.stdin:
             "result": {"thread": {
                 "id": params["threadId"],
                 "turns": [],
-                "largePayload": "x" * 70000,
+                "largePayload": "x" * (17 * 1024 * 1024),
             }},
         })
+    elif method == "thread/turns/list":
+        send({
+            "id": request_id,
+            "result": {
+                "data": [{
+                    "id": "turn-summary",
+                    "status": "completed",
+                    "items": [{"type": "agentMessage", "text": "summary only"}],
+                    "itemsView": "summary",
+                }],
+                "nextCursor": None,
+                "received": params,
+            },
+        })
     elif method == "thread/resume":
-        send({"id": request_id, "result": {"thread": {"id": params["threadId"]}}})
+        send({"id": request_id, "result": {
+            "thread": {"id": params["threadId"]}, "received": params
+        }})
+    elif method == "thread/compact/start":
+        if set(params) != {"threadId"}:
+            send({"id": request_id, "error": {"message": "unexpected compact params"}})
+        else:
+            send({"id": request_id, "result": {}})
     elif method == "thread/settings/update":
         send({"id": request_id, "result": {"applied": params}})
     elif method == "model/list":
@@ -165,7 +186,24 @@ async def test_jsonl_client_filters_threads_and_dispatches_events(tmp_path):
 
         read = await client.read_thread("thread-1")
         assert read["id"] == "thread-1"
-        assert len(read["largePayload"]) == 70000
+        assert len(read["largePayload"]) == 17 * 1024 * 1024
+
+        turns = await client.list_turns(
+            "thread-1", limit=1, items_view="summary", sort_direction="desc"
+        )
+        assert turns["data"][0]["id"] == "turn-summary"
+        assert turns["received"] == {
+            "threadId": "thread-1",
+            "limit": 1,
+            "itemsView": "summary",
+            "sortDirection": "desc",
+        }
+
+        resumed = await client.resume_thread(
+            "thread-1", cwd="/work/migrated", exclude_turns=True
+        )
+        assert resumed["received"]["cwd"] == "/work/migrated"
+        await client.compact_thread("thread-1")
 
         turn = await client.start_turn(
             "thread-1",

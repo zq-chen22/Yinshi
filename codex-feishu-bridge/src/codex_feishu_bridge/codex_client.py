@@ -14,7 +14,11 @@ from .models import ThreadSummary
 
 
 LOG = logging.getLogger(__name__)
-DEFAULT_STREAM_LIMIT_BYTES = 16 * 1024 * 1024
+# A single image-generation completion notification can legitimately contain
+# several megabytes of inline image data. The bridge no longer requests full
+# image history, but it still has to accept the live JSONL notification. Keep
+# enough headroom for multi-image turns so asyncio's line reader stays intact.
+DEFAULT_STREAM_LIMIT_BYTES = 128 * 1024 * 1024
 Message = dict[str, Any]
 NotificationHandler = Callable[[Message], Awaitable[None]]
 ServerRequestHandler = Callable[[Message], Awaitable[None]]
@@ -246,6 +250,27 @@ class CodexAppServer:
         )
         return result.get("thread", {})
 
+    async def list_turns(
+        self,
+        thread_id: str,
+        *,
+        limit: int = 100,
+        items_view: str = "summary",
+        sort_direction: str = "desc",
+        cursor: str | None = None,
+    ) -> Message:
+        """Read a bounded turn page without materializing large image payloads."""
+
+        params: Message = {
+            "threadId": thread_id,
+            "limit": limit,
+            "itemsView": items_view,
+            "sortDirection": sort_direction,
+        }
+        if cursor:
+            params["cursor"] = cursor
+        return await self.request("thread/turns/list", params)
+
     async def resume_thread(
         self,
         thread_id: str,
@@ -254,6 +279,7 @@ class CodexAppServer:
         sandbox: str | None = None,
         model: str | None = None,
         service_tier: str | None = None,
+        cwd: str | None = None,
         exclude_turns: bool = True,
     ) -> Message:
         params: dict[str, Any] = {
@@ -269,6 +295,8 @@ class CodexAppServer:
             params["model"] = model
         if service_tier:
             params["serviceTier"] = service_tier
+        if cwd:
+            params["cwd"] = cwd
         result = await self.request("thread/resume", params)
         self._resumed_threads.add(thread_id)
         return result
@@ -325,6 +353,11 @@ class CodexAppServer:
 
     async def archive_thread(self, thread_id: str) -> None:
         await self.request("thread/archive", {"threadId": thread_id})
+
+    async def compact_thread(self, thread_id: str) -> None:
+        """Start native history compaction; lifecycle notifications finish it."""
+
+        await self.request("thread/compact/start", {"threadId": thread_id})
 
     async def unsubscribe_thread(self, thread_id: str) -> None:
         await self.request("thread/unsubscribe", {"threadId": thread_id})

@@ -39,6 +39,8 @@ class FakeCodex:
         self.started_threads: list[dict[str, Any]] = []
         self.archived_threads: list[str] = []
         self.unsubscribed_threads: list[str] = []
+        self.resumed_threads: list[dict[str, Any]] = []
+        self.compacted_threads: list[str] = []
         self.models = [
             {
                 "id": "gpt-test",
@@ -64,6 +66,56 @@ class FakeCodex:
 
     async def read_thread(self, thread_id: str, **_: Any) -> dict[str, Any]:
         return {"id": thread_id, "status": {"type": "idle"}, "turns": [], "path": None}
+
+    async def list_turns(
+        self,
+        thread_id: str,
+        *,
+        limit: int = 100,
+        items_view: str = "summary",
+        sort_direction: str = "desc",
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
+        raw = await self.read_thread(thread_id)
+        turns = list(raw.get("turns") or [])
+        if sort_direction == "desc":
+            turns.reverse()
+        return {"data": turns[:limit], "nextCursor": None}
+
+    async def resume_thread(self, thread_id: str, **kwargs: Any) -> dict[str, Any]:
+        self.resumed_threads.append({"thread_id": thread_id, **kwargs})
+        return {"id": thread_id}
+
+    async def compact_thread(self, thread_id: str) -> None:
+        self.compacted_threads.append(thread_id)
+        turn = {
+            "id": f"compact-{len(self.compacted_threads)}",
+            "status": "completed",
+            "items": [],
+        }
+        for handler in self.notification_handlers:
+            await handler(
+                {
+                    "method": "turn/started",
+                    "params": {"threadId": thread_id, "turn": {"id": turn["id"]}},
+                }
+            )
+            await handler(
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": thread_id,
+                        "turnId": turn["id"],
+                        "item": {"id": "compact-item", "type": "contextCompaction"},
+                    },
+                }
+            )
+            await handler(
+                {
+                    "method": "turn/completed",
+                    "params": {"threadId": thread_id, "turn": turn},
+                }
+            )
 
     async def list_models(self) -> list[dict[str, Any]]:
         return self.models
@@ -199,6 +251,32 @@ class ThreadHistoryCodex(FakeCodex):
 
     async def read_thread(self, thread_id: str, **_: Any) -> dict[str, Any]:
         return {"id": thread_id, "status": {"type": "idle"}, "turns": self.turns}
+
+
+class ExternalActiveCodex(FakeCodex):
+    async def read_thread(self, thread_id: str, **_: Any) -> dict[str, Any]:
+        return {"id": thread_id, "status": {"type": "active"}, "turns": []}
+
+
+class SummaryOnlyCodex(FakeCodex):
+    async def read_thread(
+        self, thread_id: str, *, include_turns: bool = True
+    ) -> dict[str, Any]:
+        assert include_turns is False
+        return {"id": thread_id, "status": {"type": "idle"}}
+
+    async def list_turns(self, thread_id: str, **kwargs: Any) -> dict[str, Any]:
+        assert kwargs["items_view"] in {"summary", "notLoaded"}
+        return {
+            "data": [
+                {
+                    "id": "turn-summary",
+                    "status": "completed",
+                    "items": [{"type": "agentMessage", "text": "small"}],
+                }
+            ],
+            "nextCursor": None,
+        }
 
 
 class FakeGateway:
@@ -1535,5 +1613,161 @@ async def test_small_outbox_file_is_queued_without_second_approval(tmp_path: Pat
         assert file_item is not None
         assert file_item.msg_type == "local_file"
         assert file_item.content["path"] == str(deliverable)
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_token_usage_triggers_native_compaction_and_resets_threshold(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
+    config.auto_compact_ratio = 0.65
+    config.auto_compact_min_input_tokens = 100_000
+    db = BridgeDB(config.database_path)
+    codex = FakeCodex()
+    service = BridgeService(config, db, codex, FakeGateway())  # type: ignore[arg-type]
+    try:
+        await service._on_codex_notification(
+            {
+                "method": "thread/tokenUsage/updated",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "tokenUsage": {
+                        "last": {
+                            "inputTokens": 170_000,
+                            "cachedInputTokens": 120_000,
+                        },
+                        "modelContextWindow": 258_400,
+                    },
+                },
+            }
+        )
+
+        assert db.get_setting("token_usage:thread-1:input") == "170000"
+        assert db.get_setting("token_usage:thread-1:cached") == "120000"
+        assert service._should_auto_compact("thread-1") is True
+
+        turn = await service._compact_thread(
+            "thread-1",
+            RuntimeSettings(None, None, None, "on-request", "workspace-write"),
+        )
+
+        assert turn["status"] == "completed"
+        assert codex.compacted_threads == ["thread-1"]
+        assert service._should_auto_compact("thread-1") is False
+        assert "thread-1" not in service._compacting_threads
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_compaction_refuses_bridge_or_external_active_turn(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    runtime = RuntimeSettings(None, None, None, "on-request", "workspace-write")
+
+    db = BridgeDB(config.database_path)
+    service = BridgeService(config, db, FakeCodex(), FakeGateway())  # type: ignore[arg-type]
+    service._register_active(
+        ActiveTurn(thread_id="thread-1", turn_id="turn-active", chat_id="oc_thread")
+    )
+    try:
+        with pytest.raises(RuntimeError, match="active Codex turn"):
+            await service._compact_thread("thread-1", runtime)
+    finally:
+        db.close()
+
+    second_db = BridgeDB(tmp_path / "external.sqlite")
+    external = ExternalActiveCodex()
+    second = BridgeService(config, second_db, external, FakeGateway())  # type: ignore[arg-type]
+    try:
+        with pytest.raises(RuntimeError, match="externally active"):
+            await second._compact_thread("thread-2", runtime)
+        assert external.compacted_threads == []
+    finally:
+        second_db.close()
+
+
+@pytest.mark.asyncio
+async def test_compaction_ignores_unrelated_completed_turn_until_context_item(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
+    db = BridgeDB(config.database_path)
+    service = BridgeService(config, db, FakeCodex(), FakeGateway())  # type: ignore[arg-type]
+    waiter: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+    service._compaction_waiters["thread-1"] = waiter
+    try:
+        await service._on_codex_notification(
+            {
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turn": {"id": "unrelated-turn", "status": "completed"},
+                },
+            }
+        )
+        assert waiter.done() is False
+
+        await service._on_codex_notification(
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "compact-turn",
+                    "item": {"id": "compact-item", "type": "contextCompaction"},
+                },
+            }
+        )
+        await service._on_codex_notification(
+            {
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turn": {"id": "compact-turn", "status": "completed"},
+                },
+            }
+        )
+        assert (await waiter)["id"] == "compact-turn"
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_status_and_turn_recovery_never_load_full_image_history(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
+    db = BridgeDB(config.database_path)
+    codex = SummaryOnlyCodex()
+    service = BridgeService(config, db, codex, FakeGateway())  # type: ignore[arg-type]
+    try:
+        turns = await service._turn_summaries("thread-1", max_turns=1)
+        assert turns[0]["id"] == "turn-summary"
+        await service._compact_thread(
+            "thread-1",
+            RuntimeSettings(None, None, None, "on-request", "workspace-write"),
+        )
+        assert codex.compacted_threads == ["thread-1"]
+    finally:
+        db.close()
+
+
+def test_progress_text_is_stable_inside_heartbeat_bucket(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    db = BridgeDB(config.database_path)
+    service = BridgeService(config, db, FakeCodex(), FakeGateway())  # type: ignore[arg-type]
+    active = ActiveTurn(
+        thread_id="thread-1",
+        turn_id="turn-1",
+        chat_id="oc_thread",
+        started_monotonic=1.0,
+        last_event_monotonic=1.0,
+    )
+    try:
+        first = service._render_progress(active)
+        second = service._render_progress(active)
+        assert first == second
     finally:
         db.close()

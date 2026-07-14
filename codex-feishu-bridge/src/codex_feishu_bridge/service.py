@@ -90,6 +90,7 @@ class BridgeService:
         self.fatal_error: BaseException | None = None
         self._chat_description_retry_at: dict[str, float] = {}
         self._tasks: list[asyncio.Task[Any]] = []
+        self._background_tasks: set[asyncio.Task[Any]] = set()
         self._thread_queues: dict[str, asyncio.Queue[ScheduledMessage]] = {}
         self._thread_workers: dict[str, asyncio.Task[None]] = {}
         self._admin_queue: asyncio.Queue[ScheduledMessage] = asyncio.Queue()
@@ -99,6 +100,9 @@ class BridgeService:
         self._pending_jobs: dict[str, ScheduledMessage] = {}
         self._completed_turns: set[str] = set()
         self._finalizing: set[str] = set()
+        self._compacting_threads: set[str] = set()
+        self._compaction_waiters: dict[str, asyncio.Future[dict[str, Any]]] = {}
+        self._compaction_turns: dict[str, str] = {}
         self._warned: set[str] = set()
         self._runtime_compatibility_error: str | None = None
         self.codex.add_notification_handler(self._on_codex_notification)
@@ -144,13 +148,14 @@ class BridgeService:
 
     async def stop(self) -> None:
         self._stop.set()
-        for task in [*self._tasks, *self._thread_workers.values()]:
+        for task in [*self._tasks, *self._thread_workers.values(), *self._background_tasks]:
             task.cancel()
-        for task in [*self._tasks, *self._thread_workers.values()]:
+        for task in [*self._tasks, *self._thread_workers.values(), *self._background_tasks]:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
         self._tasks.clear()
         self._thread_workers.clear()
+        self._background_tasks.clear()
         self.gateway.stop_receivers()
         await self.codex.close()
 
@@ -166,6 +171,26 @@ class BridgeService:
             self.fatal_error = error
             LOG.critical("Critical bridge worker %s stopped: %s", name, error)
             self._stop.set()
+
+        task.add_done_callback(completed)
+        return task
+
+    def _background_task(self, awaitable: Any, name: str) -> asyncio.Task[Any]:
+        task = asyncio.create_task(awaitable, name=name)
+        self._background_tasks.add(task)
+
+        def completed(value: asyncio.Task[Any]) -> None:
+            self._background_tasks.discard(value)
+            if value.cancelled():
+                return
+            error = value.exception()
+            if error:
+                LOG.error(
+                    "Background bridge task %s failed: %s",
+                    name,
+                    error,
+                    exc_info=(type(error), error, error.__traceback__),
+                )
 
         task.add_done_callback(completed)
         return task
@@ -266,6 +291,47 @@ class BridgeService:
             binding = self.db.get_binding_by_thread(thread_id) or binding
         return binding
 
+    async def _turn_summaries(
+        self,
+        thread_id: str,
+        *,
+        items_view: str = "summary",
+        max_turns: int = 500,
+    ) -> list[dict[str, Any]]:
+        """Read bounded, image-free turn pages newest first.
+
+        ``thread/read(includeTurns=True)`` can serialize every persisted image
+        into one JSON line. A handful of generated images is enough to block
+        or exceed an app-server stream limit, so polling and recovery use the
+        paginated summary API instead.
+        """
+
+        turns: list[dict[str, Any]] = []
+        cursor: str | None = None
+        while len(turns) < max_turns:
+            page = await self.codex.list_turns(
+                thread_id,
+                limit=min(100, max_turns - len(turns)),
+                items_view=items_view,
+                sort_direction="desc",
+                cursor=cursor,
+            )
+            batch = list(page.get("data") or [])
+            turns.extend(batch)
+            cursor = page.get("nextCursor")
+            if not cursor or not batch:
+                break
+        return turns
+
+    async def _find_turn_summary(
+        self, thread_id: str, turn_id: str
+    ) -> dict[str, Any] | None:
+        turns = await self._turn_summaries(thread_id, max_turns=100)
+        return next(
+            (turn for turn in turns if str(turn.get("id") or "") == turn_id),
+            None,
+        )
+
     async def _create_binding_chat(self, binding: Binding, owner: str) -> None:
         recovered = await self.gateway.find_conversation_chat(binding.thread_id, owner)
         if recovered:
@@ -280,8 +346,8 @@ class BridgeService:
             )
         self.db.bind_chat(binding.thread_id, chat_id, actual_name.removesuffix(self.config.group_suffix))
         with contextlib.suppress(Exception):
-            raw = await self.codex.read_thread(binding.thread_id, include_turns=True)
-            self._baseline_external_sync(binding.thread_id, raw)
+            turns = await self._turn_summaries(binding.thread_id)
+            self._baseline_external_sync(binding.thread_id, turns)
         await self.gateway.send_card(
             "conversation",
             chat_id,
@@ -337,11 +403,11 @@ class BridgeService:
             if not binding or not binding.chat_id or thread.thread_id in self._active_by_thread:
                 continue
             try:
-                raw = await self.codex.read_thread(thread.thread_id, include_turns=True)
+                turns = await self._turn_summaries(thread.thread_id)
                 if self.db.get_setting(self._external_sync_key(thread.thread_id), "0") != "1":
-                    self._baseline_external_sync(thread.thread_id, raw)
+                    self._baseline_external_sync(thread.thread_id, turns)
                     continue
-                for turn in raw.get("turns") or []:
+                for turn in reversed(turns):
                     turn_id = str(turn.get("id") or "")
                     if (
                         not turn_id
@@ -369,7 +435,9 @@ class BridgeService:
     def _external_sync_key(thread_id: str) -> str:
         return f"external_sync_initialized:{thread_id}"
 
-    def _baseline_external_sync(self, thread_id: str, raw: dict[str, Any]) -> None:
+    def _baseline_external_sync(
+        self, thread_id: str, turns: list[dict[str, Any]]
+    ) -> None:
         """Record the current terminal turns without delivering historical replies.
 
         The initialization marker is written last.  If the process stops while
@@ -377,7 +445,7 @@ class BridgeService:
         idempotent operation instead of treating partial history as new output.
         """
 
-        for turn in raw.get("turns") or []:
+        for turn in turns:
             turn_id = str(turn.get("id") or "")
             if turn_id and turn.get("status") in {"completed", "failed", "interrupted"}:
                 self.db.mark_turn_synced(thread_id, turn_id)
@@ -413,14 +481,8 @@ class BridgeService:
                 return
             for active in list(self._active_by_turn.values()):
                 try:
-                    raw = await self.codex.read_thread(active.thread_id, include_turns=True)
-                    turn = next(
-                        (
-                            value
-                            for value in raw.get("turns") or []
-                            if str(value.get("id") or "") == active.turn_id
-                        ),
-                        None,
+                    turn = await self._find_turn_summary(
+                        active.thread_id, active.turn_id
                     )
                     if turn and turn.get("status") in {"completed", "failed", "interrupted"}:
                         await self._finalize_turn(active, turn)
@@ -442,15 +504,7 @@ class BridgeService:
                 started_monotonic=time.monotonic(),
             )
             try:
-                raw = await self.codex.read_thread(job.thread_id, include_turns=True)
-                turn = next(
-                    (
-                        value
-                        for value in raw.get("turns") or []
-                        if str(value.get("id") or "") == job.turn_id
-                    ),
-                    None,
-                )
+                turn = await self._find_turn_summary(job.thread_id, job.turn_id)
                 if turn and turn.get("status") in {"completed", "failed", "interrupted"}:
                     if known_active is None:
                         self._register_active(active)
@@ -863,6 +917,37 @@ class BridgeService:
             )
             self.db.complete_incoming(message.message_id)
             return
+        if text in {"!compact", "/compact"}:
+            queue = self._thread_queues.get(binding.thread_id)
+            if (
+                binding.thread_id in self._active_by_thread
+                or binding.thread_id in self._compacting_threads
+                or (queue is not None and not queue.empty())
+            ):
+                await self.gateway.send_text(
+                    "conversation",
+                    message.chat_id,
+                    "当前线程仍在执行或排队；为避免原生压缩替换活动 turn，"
+                    "本次没有压缩。请等待任务完成后重试 `/compact`。",
+                    idempotency_key=f"compact-busy:{message.message_id}",
+                )
+                self.db.complete_incoming(message.message_id)
+                return
+            progress_id = await self.gateway.send_card(
+                "conversation",
+                message.chat_id,
+                progress_card(
+                    "Codex 正在压缩上下文",
+                    "使用原生 `thread/compact/start` 保留关键上下文并清理旧工具/图片链。",
+                ),
+                idempotency_key=f"compact:{message.message_id}",
+            )
+            self.db.complete_incoming(message.message_id)
+            self._background_task(
+                self._manual_compaction(binding, progress_id),
+                f"manual-compact:{binding.thread_id}",
+            )
+            return
         if text.startswith("!steer "):
             message.text = text[7:].strip()
             active = self._active_by_thread.get(binding.thread_id)
@@ -925,6 +1010,7 @@ class BridgeService:
                 "• `/permissions`：选择权限预设\n"
                 "• `/status`：查看当前会话配置\n"
                 "• `/compat`：检测并修复 CLI 设置兼容门禁\n"
+                "• `/compact`：在对话空闲时原生压缩长上下文\n"
                 "飞书会用按钮代替终端里的选择弹窗。"
             )
         elif kind in {"配置", "设置", "状态"}:
@@ -1416,14 +1502,8 @@ class BridgeService:
     async def _steer(self, item: InboxItem, binding: Binding, active: ActiveTurn) -> None:
         message = item.message
         try:
-            raw = await self.codex.read_thread(binding.thread_id, include_turns=True)
-            persisted_turn = next(
-                (
-                    value
-                    for value in raw.get("turns") or []
-                    if str(value.get("id") or "") == active.turn_id
-                ),
-                None,
+            persisted_turn = await self._find_turn_summary(
+                binding.thread_id, active.turn_id
             )
             if persisted_turn and persisted_turn.get("status") in {
                 "completed",
@@ -1466,6 +1546,173 @@ class BridgeService:
             "↪️ 已把补充要求送入当前执行。",
             idempotency_key=f"steered:{message.message_id}",
         )
+
+    async def _manual_compaction(
+        self, binding: Binding, progress_message_id: str
+    ) -> None:
+        thread_id = binding.thread_id
+        lease_ttl = max(300, int(self.config.compaction_timeout_seconds) + 300)
+        if not self.db.acquire_thread_lease(
+            thread_id, self.worker_id, ttl_seconds=lease_ttl
+        ):
+            await self.gateway.patch_card(
+                "conversation",
+                progress_message_id,
+                progress_card(
+                    "Codex 未压缩",
+                    "线程安全租约正被其他任务持有，请稍后重试 `/compact`。",
+                    color="orange",
+                ),
+            )
+            return
+        try:
+            runtime = self._runtime_settings(thread_id)
+            await self._compact_thread(thread_id, runtime)
+            await self.gateway.patch_card(
+                "conversation",
+                progress_message_id,
+                progress_card(
+                    "Codex 上下文已压缩",
+                    "线程 ID 与飞书群绑定保持不变；旧工具调用和截图链已由原生压缩摘要替换。",
+                    color="green",
+                ),
+            )
+        except Exception as error:
+            LOG.exception("Manual compaction failed for %s", thread_id)
+            with contextlib.suppress(Exception):
+                await self.gateway.patch_card(
+                    "conversation",
+                    progress_message_id,
+                    progress_card(
+                        "Codex 压缩失败",
+                        f"未启动新的用户 turn；原历史仍保留。错误：{type(error).__name__}",
+                        color="red",
+                    ),
+                )
+        finally:
+            self.db.release_thread_lease(thread_id, self.worker_id)
+
+    async def _compact_thread(
+        self, thread_id: str, runtime: RuntimeSettings
+    ) -> dict[str, Any]:
+        if thread_id in self._active_by_thread:
+            raise RuntimeError("refusing to compact an active Codex turn")
+        if thread_id in self._compacting_threads:
+            raise RuntimeError("thread compaction is already running")
+        # Native compaction replaces an active task. A task may have been
+        # started from the local CLI, so the in-memory active map is not enough.
+        raw = await self.codex.read_thread(thread_id, include_turns=False)
+        latest = await self._turn_summaries(
+            thread_id, items_view="notLoaded", max_turns=1
+        )
+        status_type = str((raw.get("status") or {}).get("type") or "")
+        latest_status = str((latest[0].get("status") if latest else "") or "")
+        if status_type == "active" or latest_status == "inProgress":
+            raise RuntimeError("refusing to replace an externally active Codex turn")
+        self._compacting_threads.add(thread_id)
+        try:
+            resumed = await self.codex.resume_thread(
+                thread_id,
+                approval_policy=runtime.approval_policy,
+                sandbox=runtime.sandbox,
+                model=runtime.model,
+                service_tier=runtime.service_tier,
+                exclude_turns=True,
+            )
+            resumed_thread = resumed.get("thread") or resumed
+            resumed_status = str(
+                ((resumed_thread.get("status") or {}).get("type") or "")
+                if isinstance(resumed_thread, dict)
+                else ""
+            )
+            if resumed_status == "active":
+                raise RuntimeError("refusing to replace an externally active Codex turn")
+
+            # The server may emit lifecycle events before acknowledging the
+            # RPC, so install the waiter immediately before compact/start.
+            loop = asyncio.get_running_loop()
+            waiter: asyncio.Future[dict[str, Any]] = loop.create_future()
+            self._compaction_waiters[thread_id] = waiter
+            self._compaction_turns.pop(thread_id, None)
+            await self.codex.compact_thread(thread_id)
+            turn = await asyncio.wait_for(
+                asyncio.shield(waiter), timeout=self.config.compaction_timeout_seconds
+            )
+            status = str(turn.get("status") or "completed")
+            if status != "completed":
+                error = turn.get("error") or {}
+                raise RuntimeError(
+                    f"compaction turn ended as {status}: {error.get('message', error)}"
+                )
+            self.db.set_setting(f"token_usage:{thread_id}:input", "0")
+            self.db.set_setting(
+                f"token_usage:{thread_id}:compacted_at", str(int(time.time()))
+            )
+            self.db.delete_setting(f"token_usage:{thread_id}:compact_retry_after")
+            return turn
+        finally:
+            current = self._compaction_waiters.pop(thread_id, None)
+            if current and not current.done():
+                current.cancel()
+            self._compaction_turns.pop(thread_id, None)
+            self._compacting_threads.discard(thread_id)
+
+    def _should_auto_compact(self, thread_id: str) -> bool:
+        retry_after = int(
+            self.db.get_setting(
+                f"token_usage:{thread_id}:compact_retry_after", "0"
+            )
+            or 0
+        )
+        if retry_after > int(time.time()):
+            return False
+        input_tokens = int(
+            self.db.get_setting(f"token_usage:{thread_id}:input", "0") or 0
+        )
+        context_window = int(
+            self.db.get_setting(f"token_usage:{thread_id}:window", "0") or 0
+        )
+        return bool(
+            context_window > 0
+            and input_tokens >= self.config.auto_compact_min_input_tokens
+            and input_tokens / context_window >= self.config.auto_compact_ratio
+        )
+
+    async def _maybe_auto_compact(
+        self,
+        thread_id: str,
+        runtime: RuntimeSettings,
+        job: ScheduledMessage,
+    ) -> None:
+        if not self._should_auto_compact(thread_id):
+            return
+        with contextlib.suppress(Exception):
+            await self.gateway.patch_card(
+                job.app_role,
+                job.progress_message_id,
+                progress_card(
+                    "Codex 正在整理长上下文",
+                    "检测到历史接近配置阈值，先执行原生压缩；完成后会自动继续本条消息。",
+                ),
+            )
+        try:
+            await self._compact_thread(thread_id, runtime)
+        except Exception:
+            self.db.set_setting(
+                f"token_usage:{thread_id}:compact_retry_after",
+                str(int(time.time()) + 3_600),
+            )
+            LOG.exception("Automatic compaction failed for %s; continuing turn", thread_id)
+            with contextlib.suppress(Exception):
+                await self.gateway.patch_card(
+                    job.app_role,
+                    job.progress_message_id,
+                    progress_card(
+                        "Codex 压缩未完成",
+                        "本次不会重复压缩；将继续启动用户任务，并在一小时后才允许自动重试。",
+                        color="orange",
+                    ),
+                )
 
     async def _queue_thread_message(self, item: InboxItem, binding: Binding) -> None:
         queue = self._thread_queues.setdefault(binding.thread_id, asyncio.Queue())
@@ -1520,12 +1767,16 @@ class BridgeService:
         while active := self._active_by_thread.get(thread_id):
             await self._turn_done.setdefault(active.turn_id, asyncio.Event()).wait()
         await self._wait_thread_available(thread_id, job)
-        if not self.db.acquire_thread_lease(thread_id, self.worker_id, ttl_seconds=300):
+        lease_ttl = max(300, int(self.config.compaction_timeout_seconds) + 300)
+        if not self.db.acquire_thread_lease(
+            thread_id, self.worker_id, ttl_seconds=lease_ttl
+        ):
             self.db.fail_incoming(message.message_id, "thread lease busy", retry_after_seconds=15)
             return
         try:
-            inputs = await self.artifacts.prepare_inputs(message)
             runtime = self._runtime_settings(thread_id)
+            await self._maybe_auto_compact(thread_id, runtime, job)
+            inputs = await self.artifacts.prepare_inputs(message)
             self.db.mark_incoming_dispatching(message.message_id)
             self._pending_jobs[thread_id] = job
             try:
@@ -1617,7 +1868,10 @@ class BridgeService:
                 self.db.delete_setting(f"thread_override_until:{thread_id}")
                 return
             try:
-                raw = await self.codex.read_thread(thread_id, include_turns=True)
+                raw = await self.codex.read_thread(thread_id, include_turns=False)
+                turns = await self._turn_summaries(
+                    thread_id, items_view="notLoaded", max_turns=1
+                )
             except Exception as error:
                 notice = f"暂时无法核对本机 thread 状态：{type(error).__name__}；仍在等待。"
                 if notice != last_notice:
@@ -1625,8 +1879,7 @@ class BridgeService:
                     last_notice = notice
                 await asyncio.sleep(5)
                 continue
-            turns = raw.get("turns") or []
-            latest = turns[-1] if turns else {}
+            latest = turns[0] if turns else {}
             latest_status = str(latest.get("status") or "")
             status_type = str((raw.get("status") or {}).get("type") or "")
             rollout_path = Path(str(raw.get("path"))) if raw.get("path") else None
@@ -1693,6 +1946,7 @@ class BridgeService:
                 "• `解除线程 threadID`：本机核对进程中断的 turn 后解除安全锁\n"
                 "• `/model` / `/fast` / `/permissions` / `/status`：按 Codex CLI 方式管理临时任务配置\n"
                 "• `/compat`：检测并修复 CLI 升级后的设置兼容门禁\n"
+                "• 群聊 `/compact`：在对应会话空闲时压缩长上下文\n"
                 "其他文字会在一个临时、上下文无关的 Codex 对话中处理。"
             )
             await self._admin_reply(message, reply, "help")
@@ -1940,7 +2194,12 @@ class BridgeService:
                 if not active.progress_message_id:
                     continue
                 rendered = self._render_progress(active)
-                if rendered == active.last_progress_text:
+                now = time.monotonic()
+                if (
+                    rendered == active.last_progress_text
+                    and now - active.last_progress_monotonic
+                    < self.config.progress_heartbeat_seconds
+                ):
                     continue
                 try:
                     await self.gateway.patch_card(
@@ -1955,7 +2214,23 @@ class BridgeService:
 
     def _render_progress(self, active: ActiveTurn) -> str:
         elapsed = int(max(0, time.monotonic() - active.started_monotonic))
-        lines = [f"**已运行：** {elapsed // 60:02d}:{elapsed % 60:02d}"]
+        heartbeat = max(1, int(self.config.progress_heartbeat_seconds))
+        displayed_elapsed = elapsed - elapsed % heartbeat
+        lines = [
+            f"**已运行：** {displayed_elapsed // 60:02d}:"
+            f"{displayed_elapsed % 60:02d}"
+        ]
+        last_event = active.last_event_monotonic or active.started_monotonic
+        quiet = int(max(0, time.monotonic() - last_event))
+        if quiet >= self.config.progress_stale_seconds:
+            quiet_display = quiet - quiet % heartbeat
+            lines.extend(
+                [
+                    "",
+                    f"⚠️ Codex 已 {quiet_display // 60} 分 {quiet_display % 60} 秒"
+                    "没有产生新事件；桥仍保持连接，未把等待误报为新进展。",
+                ]
+            )
         if active.commentary_text.strip():
             lines.extend(["", "**最新进展**", _redact(active.commentary_text.strip())[-3000:]])
         if active.current_operation:
@@ -1974,6 +2249,50 @@ class BridgeService:
         thread_id = str(params.get("threadId") or "")
         turn_raw = params.get("turn") or {}
         turn_id = str(params.get("turnId") or turn_raw.get("id") or "")
+        if method == "thread/tokenUsage/updated" and thread_id:
+            usage = params.get("tokenUsage") or {}
+            last = usage.get("last") or {}
+            self.db.set_setting(
+                f"token_usage:{thread_id}:input",
+                str(int(last.get("inputTokens") or 0)),
+            )
+            self.db.set_setting(
+                f"token_usage:{thread_id}:cached",
+                str(int(last.get("cachedInputTokens") or 0)),
+            )
+            window = int(usage.get("modelContextWindow") or 0)
+            if window:
+                self.db.set_setting(f"token_usage:{thread_id}:window", str(window))
+            active_usage = self._active_by_thread.get(thread_id)
+            if active_usage:
+                active_usage.last_event_monotonic = time.monotonic()
+                active_usage.last_event_name = "token usage"
+            return
+        compaction_waiter = self._compaction_waiters.get(thread_id)
+        if compaction_waiter is not None:
+            if method == "turn/started":
+                return
+            if method in {"item/started", "item/completed"}:
+                item = params.get("item") or {}
+                if item.get("type") == "contextCompaction":
+                    if turn_id:
+                        expected = self._compaction_turns.get(thread_id)
+                        if expected and expected != turn_id:
+                            LOG.warning(
+                                "Ignoring context compaction item for unexpected turn %s "
+                                "while waiting for %s",
+                                turn_id,
+                                expected,
+                            )
+                        else:
+                            self._compaction_turns[thread_id] = turn_id
+                    return
+            if method == "turn/completed":
+                expected = self._compaction_turns.get(thread_id)
+                if expected and turn_id == expected:
+                    if not compaction_waiter.done():
+                        compaction_waiter.set_result(turn_raw)
+                    return
         active = self._active_by_turn.get(turn_id) if turn_id else None
         if method == "turn/started":
             if not active:
@@ -2023,6 +2342,8 @@ class BridgeService:
             return
         if not active:
             return
+        active.last_event_monotonic = time.monotonic()
+        active.last_event_name = method
         if method == "item/started":
             item = params.get("item") or {}
             item_id = str(item.get("id") or "")
@@ -2039,6 +2360,12 @@ class BridgeService:
                 active.current_operation = "检索网页"
             elif item_type == "imageGeneration":
                 active.current_operation = "生成图像"
+            elif item_type == "imageView":
+                active.current_operation = "查看图像"
+            elif item_type == "dynamicToolCall":
+                active.current_operation = f"调用动态工具：{item.get('tool', '')}"
+            elif item_type == "contextCompaction":
+                active.current_operation = "压缩长上下文"
         elif method == "item/agentMessage/delta":
             delta = str(params.get("delta") or "")
             phase = active.item_phases.get(str(params.get("itemId") or ""))
@@ -2067,6 +2394,12 @@ class BridgeService:
                 active.current_operation = f"文件修改：{item.get('status', '完成')}"
             elif item_type == "imageGeneration" and item.get("savedPath"):
                 active.artifact_paths.append(str(item["savedPath"]))
+            elif item_type == "imageView":
+                active.current_operation = "图像查看完成"
+            elif item_type == "dynamicToolCall":
+                active.current_operation = f"动态工具：{item.get('status', '完成')}"
+            elif item_type == "contextCompaction":
+                active.current_operation = "上下文压缩完成"
         elif method == "turn/completed":
             await self._finalize_turn(active, turn_raw)
 
@@ -2479,6 +2812,10 @@ class BridgeService:
             )
 
     def _register_active(self, active: ActiveTurn) -> None:
+        if not active.last_event_monotonic:
+            active.last_event_monotonic = time.monotonic()
+        if not active.last_event_name:
+            active.last_event_name = "turn/started"
         self._active_by_thread[active.thread_id] = active
         self._active_by_turn[active.turn_id] = active
         self._turn_done.setdefault(active.turn_id, asyncio.Event())

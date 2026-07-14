@@ -143,6 +143,8 @@ class ActiveTurn:
     final_text: str = ""
     commentary_text: str = ""
     started_monotonic: float = 0.0
+    last_event_monotonic: float = 0.0
+    last_event_name: str = ""
     last_progress_monotonic: float = 0.0
     last_progress_text: str = ""
     plan: list[dict[str, Any]] = field(default_factory=list)

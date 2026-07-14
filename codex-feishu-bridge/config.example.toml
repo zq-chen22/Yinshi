@@ -16,8 +16,15 @@ auto_discover_new_threads = true
 source_kinds = ["cli", "vscode", "appServer", "unknown"]
 sync_interval_seconds = 15
 
-# 运行中的中间消息合并后最多每 2 秒刷新一次，避免逐 token 发送。
+# 每 2 秒合并新事件；无新事件时每 30 秒发送一次心跳，避免卡片 PATCH 热循环。
 progress_update_seconds = 2.0
+progress_heartbeat_seconds = 30.0
+progress_stale_seconds = 120.0
+
+# 上一轮输入达到上下文窗口 65% 且至少 10 万 token 时，在下一轮前原生压缩。
+auto_compact_ratio = 0.65
+auto_compact_min_input_tokens = 100000
+compaction_timeout_seconds = 900.0
 group_suffix = "-你的机器名称"
 
 # 默认运行配置；键名与 Codex config.toml 对应。每个飞书对话仍可单独覆盖。

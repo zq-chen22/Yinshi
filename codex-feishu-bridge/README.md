@@ -31,6 +31,12 @@ set +a
 
 Secret 只能保存在本机 `secrets.env`，不能写入配置、聊天、截图、日志或 Git。
 
+## 长上下文与进度治理
+
+桥接器使用 `thread/turns/list` 的分页摘要核对历史，不会在轮询和恢复时把整段图片历史重新装入单条 JSONL。App Server 的实时流保留 128 MiB 上限，以容纳合法的多图完成通知。桥会记录 Codex 上报的输入 token 与模型上下文窗口；达到配置阈值后，在下一条消息开始前调用原生 `thread/compact/start`，并等待对应 `contextCompaction` turn 完成。群聊也可在 thread 空闲时发送 `/compact` 手动压缩；活动或排队时会安全拒绝。
+
+中间事件仍按 `progress_update_seconds` 合并，但无新事件时只按 `progress_heartbeat_seconds` 发送心跳；超过 `progress_stale_seconds` 会明确显示“没有新事件”，避免把计时器变化误报成持续进展。
+
 ## 命令
 
 | 命令 | 用途 |
