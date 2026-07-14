@@ -139,6 +139,19 @@ for raw in sys.stdin:
         send({"id": request_id, "result": {"primary": {"usedPercent": 12}}})
     elif method == "account/usage/read":
         send({"id": request_id, "result": {"plan": "test"}})
+    elif method == "test/ordered-notifications":
+        send({"method": "turn/started", "params": {
+            "threadId": "ordered-thread", "turn": {"id": "ordered-turn"}
+        }})
+        send({"method": "item/completed", "params": {
+            "threadId": "ordered-thread", "turnId": "ordered-turn",
+            "item": {"id": "final-item", "type": "agentMessage", "text": "done"}
+        }})
+        send({"method": "turn/completed", "params": {
+            "threadId": "ordered-thread",
+            "turn": {"id": "ordered-turn", "status": "completed"}
+        }})
+        send({"id": request_id, "result": {}})
     else:
         send({"id": request_id, "result": {}})
 '''
@@ -244,6 +257,33 @@ async def test_jsonl_client_filters_threads_and_dispatches_events(tmp_path):
         assert quota["usage"]["plan"] == "test"
 
 
+@pytest.mark.asyncio
+async def test_jsonl_notifications_preserve_stdout_order_when_handler_yields(tmp_path):
+    observed: list[str] = []
+    completed = asyncio.Event()
+    client = CodexAppServer(
+        codex_bin=str(make_fake_codex(tmp_path)),
+        request_timeout=2,
+    )
+
+    async def on_notification(message):
+        method = str(message.get("method") or "")
+        if method == "turn/started":
+            # Regression: the old dispatcher spawned every notification as an
+            # independent task, so later items could overtake this yield.
+            await asyncio.sleep(0.05)
+        observed.append(method)
+        if method == "turn/completed":
+            completed.set()
+
+    client.add_notification_handler(on_notification)
+    async with client:
+        await client.request("test/ordered-notifications")
+        await asyncio.wait_for(completed.wait(), timeout=1)
+
+    assert observed == ["turn/started", "item/completed", "turn/completed"]
+
+
 def test_agent_message_extractors_prefer_final_answer():
     turn = {
         "id": "turn-1",
@@ -273,3 +313,42 @@ def test_latest_message_falls_back_to_completed_commentary():
         ]
     }
     assert latest_final_from_thread(thread) == ("turn-2", "执行失败")
+
+
+def test_notification_slimming_drops_inline_tool_payloads_but_keeps_paths():
+    image_result = "x" * (2 * 1024 * 1024)
+    message = {
+        "method": "turn/completed",
+        "params": {
+            "threadId": "thread-1",
+            "turn": {
+                "id": "turn-1",
+                "items": [
+                    {
+                        "id": "image-1",
+                        "type": "imageGeneration",
+                        "result": image_result,
+                        "savedPath": "/tmp/generated.png",
+                    },
+                    {
+                        "id": "command-1",
+                        "type": "commandExecution",
+                        "aggregatedOutput": "y" * 100_000,
+                        "status": "completed",
+                    },
+                    {
+                        "id": "message-1",
+                        "type": "agentMessage",
+                        "text": "最终文本必须保留",
+                    },
+                ],
+            },
+        },
+    }
+
+    slimmed = CodexAppServer._slim_notification(message)
+    items = slimmed["params"]["turn"]["items"]
+    assert "result" not in items[0]
+    assert items[0]["savedPath"] == "/tmp/generated.png"
+    assert "aggregatedOutput" not in items[1]
+    assert items[2]["text"] == "最终文本必须保留"

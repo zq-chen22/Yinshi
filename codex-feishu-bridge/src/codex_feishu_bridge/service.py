@@ -100,6 +100,8 @@ class BridgeService:
         self._pending_jobs: dict[str, ScheduledMessage] = {}
         self._completed_turns: set[str] = set()
         self._finalizing: set[str] = set()
+        self._progress_locks: dict[str, asyncio.Lock] = {}
+        self._terminal_progress_messages: set[str] = set()
         self._compacting_threads: set[str] = set()
         self._compaction_waiters: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._compaction_turns: dict[str, str] = {}
@@ -617,6 +619,12 @@ class BridgeService:
                         item.receive_id,
                         path,
                         idempotency_key=item.outbox_key,
+                    )
+                elif item.msg_type == "card_patch":
+                    await self.gateway.patch_card(
+                        item.app_role,
+                        str(item.content["message_id"]),
+                        dict(item.content["card"]),
                     )
                 elif item.msg_type == "text":
                     await self.gateway.send_text(
@@ -1592,6 +1600,74 @@ class BridgeService:
         finally:
             self.db.release_thread_lease(thread_id, self.worker_id)
 
+    def _compaction_state(self, thread_id: str) -> dict[str, Any] | None:
+        raw = self.db.get_setting(f"compaction_inflight:{thread_id}", "") or ""
+        if not raw:
+            return None
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError:
+            return {"status": "unknown", "raw": raw}
+        return value if isinstance(value, dict) else {"status": "unknown"}
+
+    def _save_compaction_state(
+        self, thread_id: str, state: dict[str, Any]
+    ) -> None:
+        state["updated_at"] = int(time.time())
+        self.db.set_setting(
+            f"compaction_inflight:{thread_id}",
+            json.dumps(state, ensure_ascii=False, separators=(",", ":")),
+        )
+
+    def _clear_compaction_state(self, thread_id: str) -> None:
+        self.db.delete_setting(f"compaction_inflight:{thread_id}")
+
+    async def _settle_prior_compaction(self, thread_id: str) -> None:
+        """Resolve a compact RPC whose acknowledgement/terminal event was lost.
+
+        Once ``thread/compact/start`` has been sent, starting a normal turn is
+        unsafe until disk state proves the compaction turn is terminal. The
+        marker survives bridge/app-server restarts and is intentionally more
+        conservative than an in-memory timeout.
+        """
+
+        state = self._compaction_state(thread_id)
+        if state is None:
+            return
+        raw = await self.codex.read_thread(thread_id, include_turns=False)
+        turns = await self._turn_summaries(
+            thread_id, items_view="summary", max_turns=20
+        )
+        status_type = str((raw.get("status") or {}).get("type") or "")
+        if status_type == "active" or any(
+            str(turn.get("status") or "") == "inProgress" for turn in turns[:1]
+        ):
+            raise RuntimeError("a previously requested context compaction is still active")
+
+        expected = str(state.get("turn_id") or "")
+        candidate = next(
+            (
+                turn
+                for turn in turns
+                if not expected or str(turn.get("id") or "") == expected
+            ),
+            None,
+        )
+        if candidate and str(candidate.get("status") or "") == "completed":
+            context_seen = bool(state.get("context_seen")) or any(
+                str(item.get("type") or "") == "contextCompaction"
+                for item in candidate.get("items") or []
+            )
+            if context_seen:
+                self.db.set_setting(f"token_usage:{thread_id}:input", "0")
+                self.db.set_setting(
+                    f"token_usage:{thread_id}:compacted_at", str(int(time.time()))
+                )
+        # Idle disk state proves that no compact turn can still replace a new
+        # user turn. A failed/unknown terminal compact may be retried normally.
+        self._clear_compaction_state(thread_id)
+        self._compaction_turns.pop(thread_id, None)
+
     async def _compact_thread(
         self, thread_id: str, runtime: RuntimeSettings
     ) -> dict[str, Any]:
@@ -1599,8 +1675,12 @@ class BridgeService:
             raise RuntimeError("refusing to compact an active Codex turn")
         if thread_id in self._compacting_threads:
             raise RuntimeError("thread compaction is already running")
-        # Native compaction replaces an active task. A task may have been
-        # started from the local CLI, so the in-memory active map is not enough.
+        await self._settle_prior_compaction(thread_id)
+        # Native compaction replaces any task that is already active on the
+        # thread. A task may have been started from the local CLI rather than
+        # through this bridge, so the in-memory active map is not sufficient.
+        # Use the bounded/image-free APIs for a final preflight before sending
+        # the destructive-to-an-active-turn compact RPC.
         raw = await self.codex.read_thread(thread_id, include_turns=False)
         latest = await self._turn_summaries(
             thread_id, items_view="notLoaded", max_turns=1
@@ -1628,12 +1708,17 @@ class BridgeService:
             if resumed_status == "active":
                 raise RuntimeError("refusing to replace an externally active Codex turn")
 
-            # The server may emit lifecycle events before acknowledging the
-            # RPC, so install the waiter immediately before compact/start.
+            # Install the waiter immediately before the RPC. The app-server may
+            # emit lifecycle events before acknowledging the request, so doing
+            # this after compact_thread() would lose fast completions.
             loop = asyncio.get_running_loop()
             waiter: asyncio.Future[dict[str, Any]] = loop.create_future()
             self._compaction_waiters[thread_id] = waiter
             self._compaction_turns.pop(thread_id, None)
+            self._save_compaction_state(
+                thread_id,
+                {"status": "requested", "requested_at": int(time.time())},
+            )
             await self.codex.compact_thread(thread_id)
             turn = await asyncio.wait_for(
                 asyncio.shield(waiter), timeout=self.config.compaction_timeout_seconds
@@ -1644,17 +1729,22 @@ class BridgeService:
                 raise RuntimeError(
                     f"compaction turn ended as {status}: {error.get('message', error)}"
                 )
+            # A fresh token-usage notification normally follows compaction. Set
+            # a conservative zero meanwhile so the next queued message does not
+            # immediately launch another compaction from stale usage data.
             self.db.set_setting(f"token_usage:{thread_id}:input", "0")
             self.db.set_setting(
                 f"token_usage:{thread_id}:compacted_at", str(int(time.time()))
             )
             self.db.delete_setting(f"token_usage:{thread_id}:compact_retry_after")
+            self._clear_compaction_state(thread_id)
             return turn
         finally:
             current = self._compaction_waiters.pop(thread_id, None)
             if current and not current.done():
                 current.cancel()
-            self._compaction_turns.pop(thread_id, None)
+            if self._compaction_state(thread_id) is None:
+                self._compaction_turns.pop(thread_id, None)
             self._compacting_threads.discard(thread_id)
 
     def _should_auto_compact(self, thread_id: str) -> bool:
@@ -1684,6 +1774,7 @@ class BridgeService:
         runtime: RuntimeSettings,
         job: ScheduledMessage,
     ) -> None:
+        await self._settle_prior_compaction(thread_id)
         if not self._should_auto_compact(thread_id):
             return
         with contextlib.suppress(Exception):
@@ -1698,21 +1789,22 @@ class BridgeService:
         try:
             await self._compact_thread(thread_id, runtime)
         except Exception:
-            self.db.set_setting(
-                f"token_usage:{thread_id}:compact_retry_after",
-                str(int(time.time()) + 3_600),
+            LOG.exception(
+                "Automatic compaction did not reach a proven terminal state for %s",
+                thread_id,
             )
-            LOG.exception("Automatic compaction failed for %s; continuing turn", thread_id)
             with contextlib.suppress(Exception):
                 await self.gateway.patch_card(
                     job.app_role,
                     job.progress_message_id,
                     progress_card(
                         "Codex 压缩未完成",
-                        "本次不会重复压缩；将继续启动用户任务，并在一小时后才允许自动重试。",
+                        "尚不能证明压缩 turn 已终止；本条用户任务会安全保留并重试，"
+                        "不会与压缩并发启动。",
                         color="orange",
                     ),
                 )
+            raise
 
     async def _queue_thread_message(self, item: InboxItem, binding: Binding) -> None:
         queue = self._thread_queues.setdefault(binding.thread_id, asyncio.Queue())
@@ -1890,6 +1982,16 @@ class BridgeService:
             busy = status_type == "active" or latest_status == "inProgress"
             if busy:
                 external_turn = str(latest.get("id") or "external-active")
+                if self._compaction_state(thread_id) is not None:
+                    notice = (
+                        "上一次上下文压缩仍在 Codex 中运行；"
+                        "消息已保留，并且不会并发启动用户 turn。"
+                    )
+                    if notice != last_notice:
+                        await self._patch_job_waiting(job, notice)
+                        last_notice = notice
+                    await asyncio.sleep(5)
+                    continue
                 if age is None or age > 300:
                     self.db.set_setting(f"blocked_thread:{thread_id}", external_turn)
                     warning = (
@@ -2195,6 +2297,8 @@ class BridgeService:
                     continue
                 rendered = self._render_progress(active)
                 now = time.monotonic()
+                if now < active.progress_retry_monotonic:
+                    continue
                 if (
                     rendered == active.last_progress_text
                     and now - active.last_progress_monotonic
@@ -2202,15 +2306,57 @@ class BridgeService:
                 ):
                     continue
                 try:
-                    await self.gateway.patch_card(
-                        active.app_role,
-                        active.progress_message_id,
+                    patched = await self._patch_active_progress(
+                        active,
                         progress_card("Codex 执行中", rendered),
+                        terminal=False,
                     )
-                    active.last_progress_text = rendered
-                    active.last_progress_monotonic = time.monotonic()
-                except Exception:
-                    LOG.exception("Failed updating progress card for %s", active.turn_id)
+                    if patched:
+                        active.last_progress_text = rendered
+                        active.last_progress_monotonic = time.monotonic()
+                        active.progress_failures = 0
+                        active.progress_retry_monotonic = 0.0
+                except Exception as error:
+                    active.progress_failures += 1
+                    delay = min(300, 2 ** min(active.progress_failures, 8))
+                    active.progress_retry_monotonic = time.monotonic() + delay
+                    if active.progress_failures == 1 or (
+                        active.progress_failures & (active.progress_failures - 1)
+                    ) == 0:
+                        LOG.warning(
+                            "Progress card update for %s failed %d time(s); "
+                            "retrying in %ds: %s",
+                            active.turn_id,
+                            active.progress_failures,
+                            delay,
+                            error,
+                        )
+
+    async def _patch_active_progress(
+        self,
+        active: ActiveTurn,
+        card: dict[str, Any],
+        *,
+        terminal: bool,
+    ) -> bool:
+        message_id = active.progress_message_id
+        if not message_id:
+            return False
+        lock = self._progress_locks.setdefault(message_id, asyncio.Lock())
+        async with lock:
+            if not terminal and (
+                message_id in self._terminal_progress_messages
+                or active.turn_id in self._finalizing
+                or active.turn_id in self._completed_turns
+            ):
+                return False
+            await self.gateway.patch_card(active.app_role, message_id, card)
+            if terminal:
+                # Keep the terminal revision sticky. A progress PATCH that was
+                # already waiting on this lock must never overwrite it with an
+                # older "running" card after the turn has completed.
+                self._terminal_progress_messages.add(message_id)
+            return True
 
     def _render_progress(self, active: ActiveTurn) -> str:
         elapsed = int(max(0, time.monotonic() - active.started_monotonic))
@@ -2269,14 +2415,27 @@ class BridgeService:
                 active_usage.last_event_name = "token usage"
             return
         compaction_waiter = self._compaction_waiters.get(thread_id)
-        if compaction_waiter is not None:
+        compaction_state = self._compaction_state(thread_id) if thread_id else None
+        if compaction_waiter is not None or compaction_state is not None:
+            compaction_state = dict(compaction_state or {})
             if method == "turn/started":
-                return
+                expected = str(compaction_state.get("turn_id") or "")
+                if turn_id and (not expected or expected == turn_id):
+                    self._compaction_turns[thread_id] = turn_id
+                    compaction_state.update(
+                        {"status": "running", "turn_id": turn_id}
+                    )
+                    self._save_compaction_state(thread_id, compaction_state)
+                    return
             if method in {"item/started", "item/completed"}:
                 item = params.get("item") or {}
                 if item.get("type") == "contextCompaction":
                     if turn_id:
-                        expected = self._compaction_turns.get(thread_id)
+                        expected = str(
+                            compaction_state.get("turn_id")
+                            or self._compaction_turns.get(thread_id)
+                            or ""
+                        )
                         if expected and expected != turn_id:
                             LOG.warning(
                                 "Ignoring context compaction item for unexpected turn %s "
@@ -2286,13 +2445,44 @@ class BridgeService:
                             )
                         else:
                             self._compaction_turns[thread_id] = turn_id
+                            compaction_state.update(
+                                {
+                                    "status": "running",
+                                    "turn_id": turn_id,
+                                    "context_seen": True,
+                                }
+                            )
+                            self._save_compaction_state(thread_id, compaction_state)
                     return
             if method == "turn/completed":
-                expected = self._compaction_turns.get(thread_id)
+                expected = str(
+                    compaction_state.get("turn_id")
+                    or self._compaction_turns.get(thread_id)
+                    or ""
+                )
                 if expected and turn_id == expected:
-                    if not compaction_waiter.done():
-                        compaction_waiter.set_result(turn_raw)
-                    return
+                    status = str(turn_raw.get("status") or "completed")
+                    if not compaction_state.get("context_seen"):
+                        # A local/external turn can win the narrow race between
+                        # preflight and compact/start. Its completion is not
+                        # proof that history was compacted; keep the durable
+                        # marker and waiter unresolved until a real
+                        # contextCompaction item is observed or disk recovery
+                        # proves the request terminal.
+                        compaction_state["status"] = "terminal_without_context"
+                        self._save_compaction_state(thread_id, compaction_state)
+                    else:
+                        if status == "completed":
+                            self.db.set_setting(f"token_usage:{thread_id}:input", "0")
+                            self.db.set_setting(
+                                f"token_usage:{thread_id}:compacted_at",
+                                str(int(time.time())),
+                            )
+                        self._clear_compaction_state(thread_id)
+                        self._compaction_turns.pop(thread_id, None)
+                        if compaction_waiter is not None and not compaction_waiter.done():
+                            compaction_waiter.set_result(turn_raw)
+                        return
         active = self._active_by_turn.get(turn_id) if turn_id else None
         if method == "turn/started":
             if not active:
@@ -2407,6 +2597,7 @@ class BridgeService:
         if active.turn_id in self._finalizing or active.turn_id in self._completed_turns:
             return
         self._finalizing.add(active.turn_id)
+        finalized = False
         try:
             commentary, final = extract_agent_messages(turn)
             if final:
@@ -2422,15 +2613,37 @@ class BridgeService:
                 )
             color = "green" if status == "completed" else "orange" if status == "interrupted" else "red"
             if active.progress_message_id:
-                with contextlib.suppress(Exception):
-                    await self.gateway.patch_card(
-                        active.app_role,
-                        active.progress_message_id,
-                        progress_card(
-                            "Codex 已完成" if status == "completed" else f"Codex：{status}",
-                            self._render_progress(active),
-                            color=color,
-                        ),
+                terminal_card = progress_card(
+                    "Codex 已完成" if status == "completed" else f"Codex：{status}",
+                    self._render_progress(active),
+                    color=color,
+                )
+                try:
+                    await self._patch_active_progress(
+                        active,
+                        terminal_card,
+                        terminal=True,
+                    )
+                except Exception:
+                    LOG.warning(
+                        "Terminal card update for %s failed; queued durable retry",
+                        active.turn_id,
+                        exc_info=True,
+                    )
+                    self.db.enqueue_outbox(
+                        OutboxItem(
+                            outbox_key=f"terminal-card:{active.turn_id}",
+                            app_role=active.app_role,
+                            receive_id=active.chat_id,
+                            receive_id_type="chat_id",
+                            msg_type="card_patch",
+                            content={
+                                "message_id": active.progress_message_id,
+                                "card": terminal_card,
+                            },
+                            group_key=f"terminal-card:{active.turn_id}",
+                            sequence=0,
+                        )
                     )
             safe_final = _redact(active.final_text)
             generated_paths = self.artifacts.generated_image_paths(active.artifact_paths)
@@ -2454,15 +2667,22 @@ class BridgeService:
             ) == "1":
                 with contextlib.suppress(Exception):
                     await self.codex.archive_thread(active.thread_id)
+            finalized = True
         except Exception:
             LOG.exception("Failed finalizing Codex turn %s", active.turn_id)
         finally:
-            self._completed_turns.add(active.turn_id)
-            self._turn_done.setdefault(active.turn_id, asyncio.Event()).set()
-            self._active_by_turn.pop(active.turn_id, None)
-            if self._active_by_thread.get(active.thread_id) is active:
-                self._active_by_thread.pop(active.thread_id, None)
             self._finalizing.discard(active.turn_id)
+            if finalized:
+                self._completed_turns.add(active.turn_id)
+                self._turn_done.setdefault(active.turn_id, asyncio.Event()).set()
+                self._active_by_turn.pop(active.turn_id, None)
+                if self._active_by_thread.get(active.thread_id) is active:
+                    self._active_by_thread.pop(active.thread_id, None)
+                if active.progress_message_id:
+                    self._terminal_progress_messages.discard(
+                        active.progress_message_id
+                    )
+                    self._progress_locks.pop(active.progress_message_id, None)
 
     def _request_artifact_approval(self, active: ActiveTurn, path: Path) -> None:
         approval_id = secrets.token_urlsafe(16)

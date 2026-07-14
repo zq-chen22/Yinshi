@@ -60,7 +60,11 @@ class CodexAppServer:
         self._notification_handlers: list[NotificationHandler] = []
         self._server_request_handler: ServerRequestHandler | None = None
         self._reader_task: asyncio.Task[None] | None = None
+        self._notification_task: asyncio.Task[None] | None = None
+        self._notification_queue: asyncio.Queue[Message] | None = None
+        self._notification_queue_high_water = 0
         self._stderr_task: asyncio.Task[None] | None = None
+        self._handler_tasks: set[asyncio.Task[None]] = set()
         self._write_lock = asyncio.Lock()
         self._closed = asyncio.Event()
         self._resumed_threads: set[str] = set()
@@ -99,6 +103,11 @@ class CodexAppServer:
             limit=self.stream_limit_bytes,
         )
         self._closed.clear()
+        self._notification_queue = asyncio.Queue()
+        self._notification_queue_high_water = 0
+        self._notification_task = asyncio.create_task(
+            self._dispatch_notifications(), name="codex-app-server-notifications"
+        )
         self._reader_task = asyncio.create_task(self._read_stdout(), name="codex-app-server-reader")
         self._stderr_task = asyncio.create_task(self._read_stderr(), name="codex-app-server-stderr")
         self.initialize_result = await self.request(
@@ -137,7 +146,12 @@ class CodexAppServer:
             except TimeoutError:
                 proc.kill()
                 await proc.wait()
-        for task in (self._reader_task, self._stderr_task):
+        for task in (
+            self._reader_task,
+            self._notification_task,
+            self._stderr_task,
+            *tuple(self._handler_tasks),
+        ):
             if task and not task.done():
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -146,6 +160,8 @@ class CodexAppServer:
         self.process = None
         self._resumed_threads.clear()
         self._server_requests.clear()
+        self._handler_tasks.clear()
+        self._notification_queue = None
         self._closed.set()
 
     async def request(
@@ -355,7 +371,11 @@ class CodexAppServer:
         await self.request("thread/archive", {"threadId": thread_id})
 
     async def compact_thread(self, thread_id: str) -> None:
-        """Start native history compaction; lifecycle notifications finish it."""
+        """Start native history compaction.
+
+        The RPC acknowledges immediately. Callers must keep the thread
+        exclusively leased until the matching compaction turn completes.
+        """
 
         await self.request("thread/compact/start", {"threadId": thread_id})
 
@@ -510,8 +530,23 @@ class CodexAppServer:
                         LOG.debug("Unmatched app-server response id=%s", request_id)
                     continue
                 if method:
-                    for handler in self._notification_handlers:
-                        self._spawn_handler(handler(message), f"notification:{method}")
+                    # stdout is the protocol's only ordering boundary. Keep
+                    # reading responses here so notification handlers may make
+                    # nested RPCs without deadlocking, but dispatch every
+                    # notification through one FIFO consumer. Spawning one
+                    # task per line allowed turn/completed to overtake the
+                    # final item or even turn/started.
+                    queue = self._notification_queue
+                    if queue is not None:
+                        queue.put_nowait(self._slim_notification(message))
+                        depth = queue.qsize()
+                        if depth >= max(32, self._notification_queue_high_water * 2):
+                            self._notification_queue_high_water = depth
+                            LOG.warning(
+                                "Codex notification queue reached %d item(s); "
+                                "a downstream handler is slow",
+                                depth,
+                            )
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -530,6 +565,61 @@ class CodexAppServer:
         except asyncio.CancelledError:
             raise
 
+    async def _dispatch_notifications(self) -> None:
+        queue = self._notification_queue
+        assert queue is not None
+        try:
+            while True:
+                message = await queue.get()
+                try:
+                    for handler in tuple(self._notification_handlers):
+                        try:
+                            await handler(message)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            LOG.exception(
+                                "notification:%s failed",
+                                message.get("method") or "unknown",
+                            )
+                finally:
+                    queue.task_done()
+        except asyncio.CancelledError:
+            raise
+
+    @staticmethod
+    def _slim_notification(message: Message) -> Message:
+        """Drop persisted tool payloads that no bridge handler consumes.
+
+        Image-generation results can contain multi-megabyte base64 strings in
+        both item notifications and the completed turn. The image is already
+        durably available through ``savedPath``; retaining the inline result
+        while a slower Feishu handler runs only multiplies memory usage.
+        """
+
+        params = message.get("params")
+        if not isinstance(params, dict):
+            return message
+
+        def slim_item(item: Any) -> None:
+            if not isinstance(item, dict):
+                return
+            item_type = str(item.get("type") or "")
+            if item_type in {"imageGeneration", "image_generation_call"}:
+                item.pop("result", None)
+            elif item_type == "commandExecution":
+                item.pop("aggregatedOutput", None)
+            elif item_type in {"mcpToolCall", "dynamicToolCall", "imageView"}:
+                for key in ("result", "output", "content", "data"):
+                    item.pop(key, None)
+
+        slim_item(params.get("item"))
+        turn = params.get("turn")
+        if isinstance(turn, dict):
+            for item in turn.get("items") or []:
+                slim_item(item)
+        return message
+
     async def _dispatch_server_request(self, message: Message) -> None:
         assert self._server_request_handler is not None
         try:
@@ -541,11 +631,12 @@ class CodexAppServer:
                     message.get("id", ""), -32603, f"bridge handler failed: {type(error).__name__}"
                 )
 
-    @staticmethod
-    def _spawn_handler(awaitable: Awaitable[None], name: str) -> None:
+    def _spawn_handler(self, awaitable: Awaitable[None], name: str) -> None:
         task = asyncio.create_task(awaitable, name=name)
+        self._handler_tasks.add(task)
 
         def done(completed: asyncio.Task[None]) -> None:
+            self._handler_tasks.discard(completed)
             with contextlib.suppress(asyncio.CancelledError):
                 error = completed.exception()
                 if error:

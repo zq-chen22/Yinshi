@@ -147,6 +147,8 @@ class ActiveTurn:
     last_event_name: str = ""
     last_progress_monotonic: float = 0.0
     last_progress_text: str = ""
+    progress_failures: int = 0
+    progress_retry_monotonic: float = 0.0
     plan: list[dict[str, Any]] = field(default_factory=list)
     current_operation: str = ""
     diff: str = ""

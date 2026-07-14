@@ -56,7 +56,7 @@ class BridgeConfig:
     progress_stale_seconds: float = 120.0
     auto_compact_ratio: float = 0.65
     auto_compact_min_input_tokens: int = 100_000
-    compaction_timeout_seconds: float = 900.0
+    compaction_timeout_seconds: float = 1800.0
     group_suffix: str = "-Codex主机"
     auto_discover_new_threads: bool = True
     source_kinds: list[str] = field(
@@ -126,7 +126,7 @@ def load_config(path: str | Path | None = None) -> BridgeConfig:
             bridge.get("auto_compact_min_input_tokens", 100_000)
         ),
         compaction_timeout_seconds=float(
-            bridge.get("compaction_timeout_seconds", 900.0)
+            bridge.get("compaction_timeout_seconds", 1800.0)
         ),
         group_suffix=str(bridge.get("group_suffix", "-Codex主机")),
         auto_discover_new_threads=bool(bridge.get("auto_discover_new_threads", True)),

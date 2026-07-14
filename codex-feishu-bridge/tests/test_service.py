@@ -258,6 +258,39 @@ class ExternalActiveCodex(FakeCodex):
         return {"id": thread_id, "status": {"type": "active"}, "turns": []}
 
 
+class HangingCompactionCodex(FakeCodex):
+    def __init__(self) -> None:
+        super().__init__()
+        self.requested = False
+        self.terminal = False
+
+    async def compact_thread(self, thread_id: str) -> None:
+        self.compacted_threads.append(thread_id)
+        self.requested = True
+
+    async def read_thread(self, thread_id: str, **_: Any) -> dict[str, Any]:
+        return {
+            "id": thread_id,
+            "status": {"type": "idle" if self.terminal or not self.requested else "active"},
+            "path": None,
+            "turns": [],
+        }
+
+    async def list_turns(self, thread_id: str, **_: Any) -> dict[str, Any]:
+        if not self.terminal:
+            return {"data": [], "nextCursor": None}
+        return {
+            "data": [
+                {
+                    "id": "compact-late",
+                    "status": "completed",
+                    "items": [{"id": "context", "type": "contextCompaction"}],
+                }
+            ],
+            "nextCursor": None,
+        }
+
+
 class SummaryOnlyCodex(FakeCodex):
     async def read_thread(
         self, thread_id: str, *, include_turns: bool = True
@@ -284,6 +317,7 @@ class FakeGateway:
         self.configured_roles = configured_roles or set()
         self.texts: list[dict[str, Any]] = []
         self.cards: list[dict[str, Any]] = []
+        self.patches: list[dict[str, Any]] = []
         self.history: list[IncomingMessage] = []
         self.history_calls: list[dict[str, Any]] = []
         self.downloads: list[tuple[AppRole, Attachment]] = []
@@ -315,6 +349,13 @@ class FakeGateway:
             {"role": role, "receive_id": receive_id, "card": card, **kwargs}
         )
         return f"card-{len(self.cards)}"
+
+    async def patch_card(
+        self, role: AppRole, message_id: str, card: dict[str, Any]
+    ) -> None:
+        self.patches.append(
+            {"role": role, "message_id": message_id, "card": card}
+        )
 
     async def download_attachment(
         self, role: AppRole, attachment: Attachment
@@ -1618,6 +1659,188 @@ async def test_small_outbox_file_is_queued_without_second_approval(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_terminal_progress_card_cannot_be_overwritten_by_inflight_progress(
+    tmp_path: Path,
+) -> None:
+    class DelayedPatchGateway(FakeGateway):
+        def __init__(self) -> None:
+            super().__init__()
+            self.running_started = asyncio.Event()
+            self.release_running = asyncio.Event()
+            self.patch_titles: list[str] = []
+
+        async def patch_card(
+            self, role: AppRole, message_id: str, card: dict[str, Any]
+        ) -> None:
+            title = str(((card.get("header") or {}).get("title") or {}).get("content") or "")
+            if "执行中" in title:
+                self.running_started.set()
+                await self.release_running.wait()
+            self.patch_titles.append(title)
+
+    config = make_config(tmp_path)
+    db = BridgeDB(config.database_path)
+    gateway = DelayedPatchGateway()
+    service = BridgeService(config, db, FakeCodex(), gateway)  # type: ignore[arg-type]
+    active = ActiveTurn(
+        thread_id="thread-1",
+        turn_id="turn-progress-race",
+        chat_id="oc_thread",
+        progress_message_id="card-progress-race",
+    )
+    service._register_active(active)
+    try:
+        progress = asyncio.create_task(
+            service._patch_active_progress(
+                active,
+                {"header": {"title": {"content": "Codex 执行中"}}},
+                terminal=False,
+            )
+        )
+        await gateway.running_started.wait()
+        final = asyncio.create_task(
+            service._finalize_turn(
+                active,
+                {
+                    "status": "completed",
+                    "items": [
+                        {
+                            "type": "agentMessage",
+                            "phase": "final_answer",
+                            "text": "完成",
+                        }
+                    ],
+                },
+            )
+        )
+        await asyncio.sleep(0)
+        gateway.release_running.set()
+        await asyncio.gather(progress, final)
+
+        assert gateway.patch_titles[-1] == "Codex 已完成"
+        assert await service._patch_active_progress(
+            active,
+            {"header": {"title": {"content": "Codex 执行中"}}},
+            terminal=False,
+        ) is False
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_progress_patch_failure_backs_off_instead_of_hot_looping(
+    tmp_path: Path,
+) -> None:
+    class FailingPatchGateway(FakeGateway):
+        def __init__(self) -> None:
+            super().__init__()
+            self.attempts = 0
+
+        async def patch_card(
+            self, role: AppRole, message_id: str, card: dict[str, Any]
+        ) -> None:
+            self.attempts += 1
+            raise RuntimeError("Feishu unavailable")
+
+    config = make_config(tmp_path)
+    config.progress_update_seconds = 0.01
+    db = BridgeDB(config.database_path)
+    gateway = FailingPatchGateway()
+    service = BridgeService(config, db, FakeCodex(), gateway)  # type: ignore[arg-type]
+    active = ActiveTurn(
+        thread_id="thread-1",
+        turn_id="turn-progress-backoff",
+        chat_id="oc_thread",
+        progress_message_id="card-progress-backoff",
+        started_monotonic=1.0,
+    )
+    service._register_active(active)
+    task = asyncio.create_task(service._progress_loop())
+    try:
+        await asyncio.sleep(0.08)
+        assert gateway.attempts == 1
+        assert active.progress_failures == 1
+        assert active.progress_retry_monotonic > 0
+    finally:
+        service._stop.set()
+        await asyncio.wait_for(task, timeout=1)
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_terminal_card_failure_enters_durable_outbox(
+    tmp_path: Path,
+) -> None:
+    class FailingTerminalGateway(FakeGateway):
+        async def patch_card(
+            self, role: AppRole, message_id: str, card: dict[str, Any]
+        ) -> None:
+            raise RuntimeError("temporary Feishu failure")
+
+    config = make_config(tmp_path)
+    db = BridgeDB(config.database_path)
+    service = BridgeService(
+        config, db, FakeCodex(), FailingTerminalGateway()
+    )  # type: ignore[arg-type]
+    active = ActiveTurn(
+        thread_id="thread-1",
+        turn_id="turn-terminal-retry",
+        chat_id="oc_thread",
+        progress_message_id="card-terminal-retry",
+        final_text="已完成",
+    )
+    service._register_active(active)
+    try:
+        await service._finalize_turn(active, {"status": "completed", "items": []})
+        assert db.outbox_counts() == {"pending": 2}
+        message_types: set[str] = set()
+        for _ in range(2):
+            item = db.claim_outbox("test-worker")
+            assert item is not None
+            message_types.add(item.msg_type)
+            db.complete_outbox(item.outbox_key)
+        assert message_types == {"card_patch", "text"}
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_finalize_failure_keeps_turn_recoverable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = make_config(tmp_path)
+    db = BridgeDB(config.database_path)
+    service = BridgeService(config, db, FakeCodex(), FakeGateway())  # type: ignore[arg-type]
+    active = ActiveTurn(
+        thread_id="thread-1",
+        turn_id="turn-finalize-retry",
+        chat_id="oc_thread",
+        final_text="最终结果",
+    )
+    service._register_active(active)
+    original = db.enqueue_outbox
+
+    def fail_once(*_: Any, **__: Any) -> None:
+        raise RuntimeError("simulated durable enqueue failure")
+
+    try:
+        monkeypatch.setattr(db, "enqueue_outbox", fail_once)
+        await service._finalize_turn(active, {"status": "completed", "items": []})
+        assert active.turn_id not in service._completed_turns
+        assert service._active_by_turn[active.turn_id] is active
+        assert service._turn_done[active.turn_id].is_set() is False
+
+        monkeypatch.setattr(db, "enqueue_outbox", original)
+        await service._finalize_turn(active, {"status": "completed", "items": []})
+        assert active.turn_id in service._completed_turns
+        assert active.turn_id not in service._active_by_turn
+        assert service._turn_done[active.turn_id].is_set() is True
+        assert db.outbox_counts() == {"pending": 1}
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
 async def test_token_usage_triggers_native_compaction_and_resets_threshold(
     tmp_path: Path,
 ) -> None:
@@ -1730,6 +1953,94 @@ async def test_compaction_ignores_unrelated_completed_turn_until_context_item(
             }
         )
         assert (await waiter)["id"] == "compact-turn"
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_compaction_completion_without_context_item_is_not_success(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
+    db = BridgeDB(config.database_path)
+    service = BridgeService(config, db, FakeCodex(), FakeGateway())  # type: ignore[arg-type]
+    waiter: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+    service._compaction_waiters["thread-1"] = waiter
+    service._save_compaction_state(
+        "thread-1", {"status": "requested", "requested_at": 1}
+    )
+    try:
+        await service._on_codex_notification(
+            {
+                "method": "turn/started",
+                "params": {
+                    "threadId": "thread-1",
+                    "turn": {"id": "ordinary-race-turn"},
+                },
+            }
+        )
+        await service._on_codex_notification(
+            {
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turn": {
+                        "id": "ordinary-race-turn",
+                        "status": "completed",
+                    },
+                },
+            }
+        )
+
+        assert waiter.done() is False
+        state = service._compaction_state("thread-1")
+        assert state is not None
+        assert state["status"] == "terminal_without_context"
+        assert db.get_setting("token_usage:thread-1:input") is None
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_uncertain_compaction_is_persisted_and_blocks_auto_turn(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
+    config.compaction_timeout_seconds = 0.02
+    config.auto_compact_ratio = 0.5
+    config.auto_compact_min_input_tokens = 1
+    db = BridgeDB(config.database_path)
+    codex = HangingCompactionCodex()
+    gateway = FakeGateway()
+    service = BridgeService(config, db, codex, gateway)  # type: ignore[arg-type]
+    message = incoming("om-compact-timeout")
+    job = ScheduledMessage(
+        inbox=stage(db, message),
+        binding=None,
+        progress_message_id="card-compact-timeout",
+        app_role="conversation",
+        chat_id=message.chat_id,
+    )
+    db.set_setting("token_usage:thread-1:input", "80")
+    db.set_setting("token_usage:thread-1:window", "100")
+    try:
+        with pytest.raises(TimeoutError):
+            await service._maybe_auto_compact(
+                "thread-1",
+                RuntimeSettings(None, None, None, "on-request", "workspace-write"),
+                job,
+            )
+        assert service._compaction_state("thread-1") is not None
+
+        # A later retry must keep waiting while disk still reports the compact
+        # turn active; it must not fall through to turn/start.
+        with pytest.raises(RuntimeError, match="still active"):
+            await service._settle_prior_compaction("thread-1")
+
+        codex.terminal = True
+        await service._settle_prior_compaction("thread-1")
+        assert service._compaction_state("thread-1") is None
+        assert db.get_setting("token_usage:thread-1:input") == "0"
     finally:
         db.close()
 

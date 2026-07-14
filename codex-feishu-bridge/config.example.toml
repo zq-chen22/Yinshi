@@ -24,7 +24,7 @@ progress_stale_seconds = 120.0
 # 上一轮输入达到上下文窗口 65% 且至少 10 万 token 时，在下一轮前原生压缩。
 auto_compact_ratio = 0.65
 auto_compact_min_input_tokens = 100000
-compaction_timeout_seconds = 900.0
+compaction_timeout_seconds = 1800.0
 group_suffix = "-你的机器名称"
 
 # 默认运行配置；键名与 Codex config.toml 对应。每个飞书对话仍可单独覆盖。
