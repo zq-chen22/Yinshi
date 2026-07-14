@@ -432,9 +432,8 @@ class BridgeService:
 
     async def _recover_turn_jobs(self) -> None:
         for job in self.db.list_recoverable_turn_jobs():
-            if job.turn_id in self._active_by_turn:
-                continue
-            active = ActiveTurn(
+            known_active = self._active_by_turn.get(job.turn_id)
+            active = known_active or ActiveTurn(
                 thread_id=job.thread_id,
                 turn_id=job.turn_id,
                 chat_id=job.chat_id,
@@ -453,13 +452,15 @@ class BridgeService:
                     None,
                 )
                 if turn and turn.get("status") in {"completed", "failed", "interrupted"}:
-                    self._register_active(active)
+                    if known_active is None:
+                        self._register_active(active)
                     await self._finalize_turn(active, turn)
-                else:
+                elif known_active is None:
                     await self._mark_lost_turn(active)
             except Exception:
                 LOG.exception("Could not recover persisted turn job %s", job.turn_id)
-                await self._mark_lost_turn(active)
+                if known_active is None:
+                    await self._mark_lost_turn(active)
 
     async def _turn_recovery_loop(self) -> None:
         while not self._stop.is_set():
@@ -1414,6 +1415,33 @@ class BridgeService:
 
     async def _steer(self, item: InboxItem, binding: Binding, active: ActiveTurn) -> None:
         message = item.message
+        try:
+            raw = await self.codex.read_thread(binding.thread_id, include_turns=True)
+            persisted_turn = next(
+                (
+                    value
+                    for value in raw.get("turns") or []
+                    if str(value.get("id") or "") == active.turn_id
+                ),
+                None,
+            )
+            if persisted_turn and persisted_turn.get("status") in {
+                "completed",
+                "failed",
+                "interrupted",
+            }:
+                # A completion notification can be lost while the durable turn
+                # is already terminal.  Deliver that result first and preserve
+                # the user's correction as a new FIFO turn.
+                await self._finalize_turn(active, persisted_turn)
+                await self._queue_thread_message(item, binding)
+                return
+        except Exception:
+            LOG.warning(
+                "Could not preflight turn %s before steering; falling back to turn/steer",
+                active.turn_id,
+                exc_info=True,
+            )
         inputs = await self.artifacts.prepare_inputs(message)
         self.db.mark_incoming_dispatching(message.message_id)
         try:

@@ -490,6 +490,62 @@ async def test_restart_never_resumes_stale_in_progress_turn(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
+async def test_recovery_poll_finalizes_terminal_turn_still_marked_active(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path, owner_conversation_open_id="ou_conversation_owner")
+    db = BridgeDB(config.database_path)
+    terminal_turn = {
+        "id": "turn-missed-completion",
+        "status": "interrupted",
+        "items": [
+            {
+                "type": "agentMessage",
+                "phase": "final_answer",
+                "text": "已保存的最终回复",
+            }
+        ],
+    }
+    service = BridgeService(
+        config,
+        db,
+        ThreadHistoryCodex([terminal_turn]),
+        FakeGateway(),
+    )  # type: ignore[arg-type]
+    db.upsert_turn_job(
+        TurnJob(
+            message_id="om-missed-completion",
+            thread_id="thread-1",
+            turn_id="turn-missed-completion",
+            app_role="conversation",
+            chat_id="oc_thread",
+            progress_message_id="card-missed-completion",
+            state="accepted",
+        )
+    )
+    service._register_active(
+        ActiveTurn(
+            thread_id="thread-1",
+            turn_id="turn-missed-completion",
+            chat_id="oc_thread",
+            progress_message_id="card-missed-completion",
+        )
+    )
+
+    try:
+        await service._recover_turn_jobs()
+
+        assert service._active_by_thread == {}
+        assert service._active_by_turn == {}
+        assert db.list_recoverable_turn_jobs() == []
+        outbound = db.claim_outbox("test-worker")
+        assert outbound is not None
+        assert outbound.content == {"text": "已保存的最终回复"}
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
 async def test_unauthorized_sender_is_completed_without_reply_or_codex_dispatch(
     tmp_path: Path,
 ) -> None:
@@ -575,6 +631,70 @@ async def test_same_thread_messages_are_fifo_and_steer_targets_the_active_turn(
         assert db.inbox_state("om-steer") == "done"
         assert gateway.texts[-1]["idempotency_key"] == "steered:om-steer"
         assert queue.empty()
+    finally:
+        blocker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await blocker
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_steer_after_missed_completion_delivers_result_and_queues_new_turn(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path, owner_conversation_open_id="ou_conversation_owner")
+    db = BridgeDB(config.database_path)
+    terminal_turn = {
+        "id": "turn-terminal",
+        "status": "completed",
+        "items": [
+            {
+                "type": "agentMessage",
+                "phase": "final_answer",
+                "text": "旧任务已经完成",
+            }
+        ],
+    }
+    codex = ThreadHistoryCodex([terminal_turn])
+    gateway = FakeGateway()
+    service = BridgeService(config, db, codex, gateway)  # type: ignore[arg-type]
+    bind_thread(db)
+    db.upsert_turn_job(
+        TurnJob(
+            message_id="om-original",
+            thread_id="thread-1",
+            turn_id="turn-terminal",
+            app_role="conversation",
+            chat_id="oc_thread",
+            progress_message_id="card-terminal",
+            state="running",
+        )
+    )
+    service._register_active(
+        ActiveTurn(
+            thread_id="thread-1",
+            turn_id="turn-terminal",
+            chat_id="oc_thread",
+            progress_message_id="card-terminal",
+        )
+    )
+    blocker = asyncio.create_task(asyncio.Event().wait())
+    service._thread_workers["thread-1"] = blocker
+
+    try:
+        message = incoming("om-late-steer", text="!steer 继续处理新要求")
+        await service._route_incoming(stage(db, message))
+
+        assert codex.steered == []
+        assert service._active_by_thread == {}
+        assert service._active_by_turn == {}
+        assert db.list_recoverable_turn_jobs() == []
+        assert db.inbox_state("om-late-steer") == "queued"
+        queued = service._thread_queues["thread-1"].get_nowait()
+        assert queued.inbox.message.text == "继续处理新要求"
+        outbound = db.claim_outbox("test-worker")
+        assert outbound is not None
+        assert outbound.content == {"text": "旧任务已经完成"}
     finally:
         blocker.cancel()
         with contextlib.suppress(asyncio.CancelledError):
