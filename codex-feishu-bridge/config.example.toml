@@ -35,9 +35,11 @@ progress_stale_seconds = 120.0
 # systemd 更新时先停止接新单，最多等待 6 小时让已接单任务和最终结果排空。
 shutdown_drain_timeout_seconds = 21600.0
 
-# 上一轮输入达到上下文窗口 65% 且至少 10 万 token 时，在下一轮前原生压缩。
+# 任一条件成立时，在下一轮前原生压缩：上下文达到 65%、输入达到 10 万 token，
+# 或曾查看/生成图片且输入达到 6 万 token。图片本体会进入 Codex 历史，因此更早压缩。
 auto_compact_ratio = 0.65
 auto_compact_min_input_tokens = 100000
+auto_compact_visual_input_tokens = 60000
 compaction_timeout_seconds = 1800.0
 group_suffix = "-你的机器名称"
 

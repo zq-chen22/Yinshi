@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import time
 from pathlib import Path
 from typing import Any
 
@@ -738,6 +739,44 @@ async def test_startup_continues_interrupted_bridge_turn_without_external_echo(
         await service._sync_external_updates([summary])
         assert db.claim_outbox("restart-test-2") is None
         assert len(gateway.patches) >= 2
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_startup_does_not_replay_interrupted_oversized_turn(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path, owner_conversation_open_id="ou_conversation_owner")
+    config.auto_compact_min_input_tokens = 100_000
+    db = BridgeDB(config.database_path)
+    codex = RestartContinuationCodex()
+    service = BridgeService(config, db, codex, FakeGateway())  # type: ignore[arg-type]
+    db.set_setting("token_usage:thread-1:input", "118704")
+    db.set_setting("token_usage:thread-1:window", "258400")
+    db.set_setting(
+        "token_usage:thread-1:compact_retry_after", str(int(time.time()) + 3600)
+    )
+    db.upsert_turn_job(
+        TurnJob(
+            message_id="om-before-restart",
+            thread_id="thread-1",
+            turn_id="turn-before-restart",
+            app_role="conversation",
+            chat_id="oc_thread",
+            progress_message_id="card-before-restart",
+            state="accepted",
+        )
+    )
+    try:
+        await service._recover_turn_jobs(startup=True)
+
+        assert codex.started_inputs == []
+        assert db.list_recoverable_turn_jobs() == []
+        outbound = db.claim_outbox("oversized-restart-test")
+        assert outbound is not None
+        assert "没有启动恢复 turn" in str(outbound.content.get("text"))
+        assert "已经完成了一部分现场工作" in str(outbound.content.get("text"))
     finally:
         db.close()
 
@@ -1869,6 +1908,54 @@ async def test_progress_patch_failure_backs_off_instead_of_hot_looping(
 
 
 @pytest.mark.asyncio
+async def test_stale_progress_audit_finalizes_missed_terminal_notification(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
+    config.progress_update_seconds = 0.01
+    config.progress_steady_update_seconds = 0.01
+    config.progress_stale_seconds = 0.01
+    db = BridgeDB(config.database_path)
+    turn = {
+        "id": "turn-missed-while-connected",
+        "status": "completed",
+        "items": [
+            {
+                "type": "agentMessage",
+                "phase": "final_answer",
+                "text": "后台核对找回的最终答复",
+            }
+        ],
+    }
+    service = BridgeService(
+        config,
+        db,
+        ThreadHistoryCodex([turn]),
+        FakeGateway(),
+    )  # type: ignore[arg-type]
+    active = ActiveTurn(
+        thread_id="thread-1",
+        turn_id="turn-missed-while-connected",
+        chat_id="oc_thread",
+        progress_message_id="card-missed-while-connected",
+        started_monotonic=time.monotonic() - 10,
+    )
+    service._register_active(active)
+    task = asyncio.create_task(service._progress_loop())
+    try:
+        await asyncio.wait_for(service._turn_done[active.turn_id].wait(), timeout=1)
+        assert active.turn_id in service._completed_turns
+        assert service._active_by_turn == {}
+        outbound = db.claim_outbox("stale-audit-test")
+        assert outbound is not None
+        assert outbound.content == {"text": "后台核对找回的最终答复"}
+    finally:
+        service._stop.set()
+        await asyncio.wait_for(task, timeout=1)
+        db.close()
+
+
+@pytest.mark.asyncio
 async def test_terminal_card_failure_enters_durable_outbox(
     tmp_path: Path,
 ) -> None:
@@ -1981,7 +2068,105 @@ async def test_token_usage_triggers_native_compaction_and_resets_threshold(
         assert turn["status"] == "completed"
         assert codex.compacted_threads == ["thread-1"]
         assert service._should_auto_compact("thread-1") is False
+        assert db.get_setting("token_usage:thread-1:visual_history") is None
         assert "thread-1" not in service._compacting_threads
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_compaction_thresholds_are_independent_and_visual_history_is_earlier(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
+    config.auto_compact_ratio = 0.65
+    config.auto_compact_min_input_tokens = 100_000
+    config.auto_compact_visual_input_tokens = 60_000
+    db = BridgeDB(config.database_path)
+    service = BridgeService(config, db, FakeCodex(), FakeGateway())  # type: ignore[arg-type]
+    try:
+        db.set_setting("token_usage:absolute:input", "118704")
+        db.set_setting("token_usage:absolute:window", "258400")
+        assert service._should_auto_compact("absolute") is True
+
+        db.set_setting("token_usage:ratio:input", "65000")
+        db.set_setting("token_usage:ratio:window", "100000")
+        assert service._should_auto_compact("ratio") is True
+
+        db.set_setting("token_usage:visual:input", "72415")
+        db.set_setting("token_usage:visual:window", "258400")
+        assert service._should_auto_compact("visual") is False
+
+        await service._on_codex_notification(
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "visual",
+                    "turnId": "turn-image",
+                    "item": {"id": "image-1", "type": "imageGeneration"},
+                },
+            }
+        )
+        assert db.get_setting("token_usage:visual:visual_history") == "1"
+        assert service._should_auto_compact("visual") is True
+
+        await service._on_codex_notification(
+            {
+                "method": "thread/tokenUsage/updated",
+                "params": {
+                    "threadId": "visual",
+                    "tokenUsage": {
+                        "last": {"inputTokens": 0},
+                        "modelContextWindow": 258_400,
+                    },
+                },
+            }
+        )
+        assert db.get_setting("token_usage:visual:visual_history") is None
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_incoming_feishu_image_marks_visual_history_before_compaction(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
+    config.auto_compact_visual_input_tokens = 60_000
+    db = BridgeDB(config.database_path)
+    codex = FastCompletingCodex()
+    service = BridgeService(config, db, codex, FakeGateway())  # type: ignore[arg-type]
+    bind_thread(db)
+    message = incoming("om-image-input", text="检查这张图")
+    image = config.inbox_dir / "staged.jpg"
+    image.write_bytes(b"not-decoded-by-this-test")
+    message.attachments.append(
+        Attachment(
+            kind="image",
+            name="staged.jpg",
+            message_id=message.message_id,
+            file_key="image-key",
+            mime_type="image/jpeg",
+            size=image.stat().st_size,
+            local_path=image,
+        )
+    )
+    item = stage(db, message)
+    job = ScheduledMessage(
+        inbox=item,
+        binding=db.get_binding_by_thread("thread-1"),
+        progress_message_id="progress-image-input",
+        app_role="conversation",
+        chat_id="oc_thread",
+    )
+    db.set_setting("token_usage:thread-1:input", "70000")
+    db.set_setting("token_usage:thread-1:window", "258400")
+    try:
+        await service._execute_job("thread-1", job)
+        assert codex.compacted_threads == ["thread-1"]
+        # Compaction cleared the previous hint, then the new localImage set it
+        # again for the next turn.
+        assert db.get_setting("token_usage:thread-1:visual_history") == "1"
     finally:
         db.close()
 

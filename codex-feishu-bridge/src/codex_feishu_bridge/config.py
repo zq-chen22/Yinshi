@@ -74,6 +74,7 @@ class BridgeConfig:
     shutdown_drain_timeout_seconds: float = 6 * 3600.0
     auto_compact_ratio: float = 0.65
     auto_compact_min_input_tokens: int = 100_000
+    auto_compact_visual_input_tokens: int = 60_000
     compaction_timeout_seconds: float = 1800.0
     group_suffix: str = "-鼎盛笔记本ubuntu"
     auto_discover_new_threads: bool = True
@@ -172,6 +173,9 @@ def load_config(path: str | Path | None = None) -> BridgeConfig:
         auto_compact_ratio=float(bridge.get("auto_compact_ratio", 0.65)),
         auto_compact_min_input_tokens=int(
             bridge.get("auto_compact_min_input_tokens", 100_000)
+        ),
+        auto_compact_visual_input_tokens=int(
+            bridge.get("auto_compact_visual_input_tokens", 60_000)
         ),
         compaction_timeout_seconds=float(
             bridge.get("compaction_timeout_seconds", 1800.0)

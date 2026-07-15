@@ -22,7 +22,8 @@
 
 1. [日常运维、备份与升级](06-operations.md)
 2. [故障排查](09-troubleshooting.md)
-3. [开发与未来开源](08-development-and-open-source.md)
+3. [图像任务性能与上下文治理](10-image-performance.md)
+4. [开发与未来开源](08-development-and-open-source.md)
 
 ## 文档清单
 
@@ -37,6 +38,7 @@
 | [07-security-and-data.md](07-security-and-data.md) | 凭据、身份、YOLO、附件、数据保留 |
 | [08-development-and-open-source.md](08-development-and-open-source.md) | 测试、发布、贡献、许可证和路线图 |
 | [09-troubleshooting.md](09-troubleshooting.md) | 常见症状与逐层排查 |
+| [10-image-performance.md](10-image-performance.md) | 生图固有延迟、图片历史膨胀、受控实验和隔离工作流 |
 | [SETUP_CHECKLIST.md](SETUP_CHECKLIST.md) | 可勾选的上线验收表 |
 
 ## 文档维护规则

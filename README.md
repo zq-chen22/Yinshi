@@ -38,6 +38,7 @@ Yinshi/
 5. [上线验收清单](docs/SETUP_CHECKLIST.md)
 6. [日常运维与升级](docs/06-operations.md)
 7. [安全与数据管理](docs/07-security-and-data.md)
+8. [图像任务性能与上下文治理](docs/10-image-performance.md)
 
 完整文档索引见 [docs/README.md](docs/README.md)。
 

@@ -108,6 +108,8 @@ class BridgeService:
         self._compacting_threads: set[str] = set()
         self._compaction_waiters: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._compaction_turns: dict[str, str] = {}
+        self._auditing_turns: set[str] = set()
+        self._active_audit_next: dict[str, float] = {}
         self._warned: set[str] = set()
         self._runtime_compatibility_error: str | None = None
         self.codex.add_notification_handler(self._on_codex_notification)
@@ -545,14 +547,26 @@ class BridgeService:
             try:
                 turn = await self._find_turn_summary(job.thread_id, job.turn_id)
                 if turn and turn.get("status") in {"completed", "failed", "interrupted"}:
-                    _, final_messages = extract_agent_messages(turn)
+                    commentary_messages, final_messages = extract_agent_messages(turn)
                     if (
                         startup
                         and turn.get("status") == "interrupted"
                         and not final_messages
                     ):
-                        await self._continue_interrupted_turn(job)
-                        continue
+                        if not self._compaction_threshold_reached(job.thread_id):
+                            await self._continue_interrupted_turn(job)
+                            continue
+                        # Replaying a recovery instruction into an already
+                        # oversized thread can turn a missed completion into a
+                        # second image-heavy hang. Finalize the proven terminal
+                        # turn instead; the next user message will compact
+                        # before starting.
+                        latest = commentary_messages[-1] if commentary_messages else ""
+                        active.final_text = (
+                            "Codex 已中断。检测到该对话历史已达到压缩阈值，"
+                            "为避免在超大上下文中自动续做，本次没有启动恢复 turn。"
+                            + (f"\n\n中断前最后可见进展：\n{latest}" if latest else "")
+                        )
                     if known_active is None:
                         self._register_active(active)
                     await self._finalize_turn(active, turn)
@@ -661,6 +675,28 @@ class BridgeService:
         while not self._stop.is_set():
             await asyncio.sleep(60)
             await self._recover_turn_jobs(startup=False)
+
+    async def _audit_stale_active_turn(self, active: ActiveTurn) -> None:
+        """Recover a terminal event lost while the App Server stayed connected."""
+
+        turn_id = active.turn_id
+        if turn_id in self._auditing_turns:
+            return
+        self._auditing_turns.add(turn_id)
+        try:
+            if self._active_by_turn.get(turn_id) is not active:
+                return
+            turn = await self._find_turn_summary(active.thread_id, turn_id)
+            if turn and turn.get("status") in {"completed", "failed", "interrupted"}:
+                await self._finalize_turn(active, turn)
+        except Exception:
+            LOG.warning(
+                "Could not audit stale active turn %s; will retry",
+                turn_id,
+                exc_info=True,
+            )
+        finally:
+            self._auditing_turns.discard(turn_id)
 
     async def _mark_lost_turn(self, active: ActiveTurn) -> None:
         self.db.set_turn_job_state(active.turn_id, "ambiguous")
@@ -1804,6 +1840,16 @@ class BridgeService:
     def _clear_compaction_state(self, thread_id: str) -> None:
         self.db.delete_setting(f"compaction_inflight:{thread_id}")
 
+    def _mark_compaction_success(self, thread_id: str) -> None:
+        """Reset usage and visual-history hints after proven native compaction."""
+
+        self.db.set_setting(f"token_usage:{thread_id}:input", "0")
+        self.db.set_setting(
+            f"token_usage:{thread_id}:compacted_at", str(int(time.time()))
+        )
+        self.db.delete_setting(f"token_usage:{thread_id}:compact_retry_after")
+        self.db.delete_setting(f"token_usage:{thread_id}:visual_history")
+
     async def _settle_prior_compaction(self, thread_id: str) -> None:
         """Resolve a compact RPC whose acknowledgement/terminal event was lost.
 
@@ -1841,10 +1887,7 @@ class BridgeService:
                 for item in candidate.get("items") or []
             )
             if context_seen:
-                self.db.set_setting(f"token_usage:{thread_id}:input", "0")
-                self.db.set_setting(
-                    f"token_usage:{thread_id}:compacted_at", str(int(time.time()))
-                )
+                self._mark_compaction_success(thread_id)
         # Idle disk state proves that no compact turn can still replace a new
         # user turn. A failed/unknown terminal compact may be retried normally.
         self._clear_compaction_state(thread_id)
@@ -1914,11 +1957,7 @@ class BridgeService:
             # A fresh token-usage notification normally follows compaction. Set
             # a conservative zero meanwhile so the next queued message does not
             # immediately launch another compaction from stale usage data.
-            self.db.set_setting(f"token_usage:{thread_id}:input", "0")
-            self.db.set_setting(
-                f"token_usage:{thread_id}:compacted_at", str(int(time.time()))
-            )
-            self.db.delete_setting(f"token_usage:{thread_id}:compact_retry_after")
+            self._mark_compaction_success(thread_id)
             self._clear_compaction_state(thread_id)
             return turn
         finally:
@@ -1929,6 +1968,29 @@ class BridgeService:
                 self._compaction_turns.pop(thread_id, None)
             self._compacting_threads.discard(thread_id)
 
+    def _compaction_threshold_reached(self, thread_id: str) -> bool:
+        input_tokens = int(
+            self.db.get_setting(f"token_usage:{thread_id}:input", "0") or 0
+        )
+        context_window = int(
+            self.db.get_setting(f"token_usage:{thread_id}:window", "0") or 0
+        )
+        ratio_reached = bool(
+            context_window > 0
+            and input_tokens / context_window >= self.config.auto_compact_ratio
+        )
+        absolute_reached = (
+            input_tokens >= self.config.auto_compact_min_input_tokens
+        )
+        visual_history = self.db.get_setting(
+            f"token_usage:{thread_id}:visual_history", "0"
+        ) == "1"
+        visual_reached = bool(
+            visual_history
+            and input_tokens >= self.config.auto_compact_visual_input_tokens
+        )
+        return ratio_reached or absolute_reached or visual_reached
+
     def _should_auto_compact(self, thread_id: str) -> bool:
         retry_after = int(
             self.db.get_setting(
@@ -1936,18 +1998,8 @@ class BridgeService:
             )
             or 0
         )
-        if retry_after > int(time.time()):
-            return False
-        input_tokens = int(
-            self.db.get_setting(f"token_usage:{thread_id}:input", "0") or 0
-        )
-        context_window = int(
-            self.db.get_setting(f"token_usage:{thread_id}:window", "0") or 0
-        )
-        return bool(
-            context_window > 0
-            and input_tokens >= self.config.auto_compact_min_input_tokens
-            and input_tokens / context_window >= self.config.auto_compact_ratio
+        return retry_after <= int(time.time()) and self._compaction_threshold_reached(
+            thread_id
         )
 
     async def _maybe_auto_compact(
@@ -2046,7 +2098,23 @@ class BridgeService:
             return
         try:
             runtime = self._runtime_settings(thread_id)
+            has_image_input = any(
+                attachment.kind == "image" for attachment in message.attachments
+            )
+            if has_image_input:
+                # A Feishu image is injected as localImage before Codex emits
+                # any imageView item. Mark it early so an already-large thread
+                # compacts before accepting another visual payload.
+                self.db.set_setting(
+                    f"token_usage:{thread_id}:visual_history", "1"
+                )
             await self._maybe_auto_compact(thread_id, runtime, job)
+            if has_image_input:
+                # Native compaction clears the previous-history hint. Restore
+                # it for the localImage that this new turn is about to persist.
+                self.db.set_setting(
+                    f"token_usage:{thread_id}:visual_history", "1"
+                )
             inputs = await self.artifacts.prepare_inputs(message)
             self.db.mark_incoming_dispatching(message.message_id)
             self._pending_jobs[thread_id] = job
@@ -2494,6 +2562,17 @@ class BridgeService:
                 if not active.progress_message_id:
                     continue
                 now = time.monotonic()
+                last_event = active.last_event_monotonic or active.started_monotonic
+                if (
+                    now - last_event >= self.config.progress_stale_seconds
+                    and now >= self._active_audit_next.get(active.turn_id, 0.0)
+                    and active.turn_id not in self._auditing_turns
+                ):
+                    self._active_audit_next[active.turn_id] = now + 60.0
+                    self._background_task(
+                        self._audit_stale_active_turn(active),
+                        f"stale-turn-audit:{active.turn_id}",
+                    )
                 if now < active.progress_retry_monotonic:
                     continue
                 minimum_interval = self._progress_interval(active, now)
@@ -2610,9 +2689,10 @@ class BridgeService:
         if method == "thread/tokenUsage/updated" and thread_id:
             usage = params.get("tokenUsage") or {}
             last = usage.get("last") or {}
+            input_tokens = int(last.get("inputTokens") or 0)
             self.db.set_setting(
                 f"token_usage:{thread_id}:input",
-                str(int(last.get("inputTokens") or 0)),
+                str(input_tokens),
             )
             self.db.set_setting(
                 f"token_usage:{thread_id}:cached",
@@ -2621,11 +2701,22 @@ class BridgeService:
             window = int(usage.get("modelContextWindow") or 0)
             if window:
                 self.db.set_setting(f"token_usage:{thread_id}:window", str(window))
+            if input_tokens == 0:
+                self.db.delete_setting(f"token_usage:{thread_id}:visual_history")
             active_usage = self._active_by_thread.get(thread_id)
             if active_usage:
                 active_usage.last_event_monotonic = time.monotonic()
                 active_usage.last_event_name = "token usage"
             return
+        if method == "item/completed" and thread_id:
+            completed_item = params.get("item") or {}
+            if completed_item.get("type") in {"imageGeneration", "imageView"}:
+                # Codex persists these visual blocks in the rollout. Remember
+                # that the thread is image-heavy even after bridge-side
+                # notification slimming removes the inline payload.
+                self.db.set_setting(
+                    f"token_usage:{thread_id}:visual_history", "1"
+                )
         compaction_waiter = self._compaction_waiters.get(thread_id)
         compaction_state = self._compaction_state(thread_id) if thread_id else None
         if compaction_waiter is not None or compaction_state is not None:
@@ -2685,11 +2776,7 @@ class BridgeService:
                         self._save_compaction_state(thread_id, compaction_state)
                     else:
                         if status == "completed":
-                            self.db.set_setting(f"token_usage:{thread_id}:input", "0")
-                            self.db.set_setting(
-                                f"token_usage:{thread_id}:compacted_at",
-                                str(int(time.time())),
-                            )
+                            self._mark_compaction_success(thread_id)
                         self._clear_compaction_state(thread_id)
                         self._compaction_turns.pop(thread_id, None)
                         if compaction_waiter is not None and not compaction_waiter.done():
@@ -2942,6 +3029,7 @@ class BridgeService:
                         active.progress_message_id
                     )
                     self._progress_locks.pop(active.progress_message_id, None)
+                self._active_audit_next.pop(active.turn_id, None)
 
     def _request_artifact_approval(self, active: ActiveTurn, path: Path) -> None:
         approval_id = secrets.token_urlsafe(16)
