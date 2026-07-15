@@ -40,6 +40,14 @@ class FeishuConfig:
 
 
 @dataclass(slots=True)
+class DailyStatsConfig:
+    enabled: bool = False
+    spreadsheet_token: str = ""
+    sheet_id: str = ""
+    timezone: str = "Asia/Shanghai"
+
+
+@dataclass(slots=True)
 class BridgeConfig:
     config_path: Path
     state_dir: Path = DEFAULT_STATE_DIR
@@ -51,13 +59,23 @@ class BridgeConfig:
     codex_bin: str = "codex"
     initial_thread_count: int = 3
     sync_interval_seconds: int = 15
-    progress_update_seconds: float = 2.0
+    history_poll_seconds: float = 600.0
+    history_poll_warm_seconds: float = 1800.0
+    history_poll_idle_seconds: float = 3600.0
+    history_poll_cold_seconds: float = 7200.0
+    history_warm_after_seconds: float = 6 * 3600.0
+    history_idle_after_seconds: float = 24 * 3600.0
+    history_cold_after_seconds: float = 7 * 24 * 3600.0
+    progress_update_seconds: float = 5.0
+    progress_initial_window_seconds: float = 120.0
+    progress_steady_update_seconds: float = 30.0
     progress_heartbeat_seconds: float = 30.0
     progress_stale_seconds: float = 120.0
+    shutdown_drain_timeout_seconds: float = 6 * 3600.0
     auto_compact_ratio: float = 0.65
     auto_compact_min_input_tokens: int = 100_000
     compaction_timeout_seconds: float = 1800.0
-    group_suffix: str = "-Codex主机"
+    group_suffix: str = "-鼎盛笔记本ubuntu"
     auto_discover_new_threads: bool = True
     source_kinds: list[str] = field(
         default_factory=lambda: ["cli", "vscode", "appServer", "unknown"]
@@ -65,12 +83,13 @@ class BridgeConfig:
     model: str | None = None
     model_reasoning_effort: str | None = None
     service_tier: str | None = None
-    approval_policy: str = "on-request"
-    sandbox: str = "workspace-write"
+    approval_policy: str = "never"
+    sandbox: str = "danger-full-access"
     allowed_workspace_roots: list[Path] = field(default_factory=lambda: [Path.home()])
     max_download_bytes: int = 50 * 1024 * 1024
     max_upload_bytes: int = 30 * 1024 * 1024
     feishu: FeishuConfig = field(default_factory=FeishuConfig)
+    daily_stats: DailyStatsConfig = field(default_factory=DailyStatsConfig)
 
     def prepare_dirs(self) -> None:
         for path in (
@@ -97,6 +116,7 @@ def load_config(path: str | Path | None = None) -> BridgeConfig:
 
     bridge = raw.get("bridge", {})
     feishu = raw.get("feishu", {})
+    daily_stats = raw.get("daily_stats", {})
     admin = feishu.get("admin", {})
     conversation = feishu.get("conversation", {})
     state_dir = _path(bridge.get("state_dir"), DEFAULT_STATE_DIR)
@@ -116,11 +136,39 @@ def load_config(path: str | Path | None = None) -> BridgeConfig:
         codex_bin=str(bridge.get("codex_bin", "codex")),
         initial_thread_count=int(bridge.get("initial_thread_count", 3)),
         sync_interval_seconds=int(bridge.get("sync_interval_seconds", 15)),
-        progress_update_seconds=float(bridge.get("progress_update_seconds", 2.0)),
+        history_poll_seconds=float(bridge.get("history_poll_seconds", 600.0)),
+        history_poll_warm_seconds=float(
+            bridge.get("history_poll_warm_seconds", 1800.0)
+        ),
+        history_poll_idle_seconds=float(
+            bridge.get("history_poll_idle_seconds", 3600.0)
+        ),
+        history_poll_cold_seconds=float(
+            bridge.get("history_poll_cold_seconds", 7200.0)
+        ),
+        history_warm_after_seconds=float(
+            bridge.get("history_warm_after_seconds", 6 * 3600.0)
+        ),
+        history_idle_after_seconds=float(
+            bridge.get("history_idle_after_seconds", 24 * 3600.0)
+        ),
+        history_cold_after_seconds=float(
+            bridge.get("history_cold_after_seconds", 7 * 24 * 3600.0)
+        ),
+        progress_update_seconds=float(bridge.get("progress_update_seconds", 5.0)),
+        progress_initial_window_seconds=float(
+            bridge.get("progress_initial_window_seconds", 120.0)
+        ),
+        progress_steady_update_seconds=float(
+            bridge.get("progress_steady_update_seconds", 30.0)
+        ),
         progress_heartbeat_seconds=float(
             bridge.get("progress_heartbeat_seconds", 30.0)
         ),
         progress_stale_seconds=float(bridge.get("progress_stale_seconds", 120.0)),
+        shutdown_drain_timeout_seconds=float(
+            bridge.get("shutdown_drain_timeout_seconds", 6 * 3600.0)
+        ),
         auto_compact_ratio=float(bridge.get("auto_compact_ratio", 0.65)),
         auto_compact_min_input_tokens=int(
             bridge.get("auto_compact_min_input_tokens", 100_000)
@@ -128,7 +176,7 @@ def load_config(path: str | Path | None = None) -> BridgeConfig:
         compaction_timeout_seconds=float(
             bridge.get("compaction_timeout_seconds", 1800.0)
         ),
-        group_suffix=str(bridge.get("group_suffix", "-Codex主机")),
+        group_suffix=str(bridge.get("group_suffix", "-鼎盛笔记本ubuntu")),
         auto_discover_new_threads=bool(bridge.get("auto_discover_new_threads", True)),
         source_kinds=list(
             bridge.get("source_kinds", ["cli", "vscode", "appServer", "unknown"])
@@ -140,8 +188,8 @@ def load_config(path: str | Path | None = None) -> BridgeConfig:
             else None
         ),
         service_tier=str(bridge["service_tier"]) if bridge.get("service_tier") else None,
-        approval_policy=str(bridge.get("approval_policy", "on-request")),
-        sandbox=str(bridge.get("sandbox", "workspace-write")),
+        approval_policy=str(bridge.get("approval_policy", "never")),
+        sandbox=str(bridge.get("sandbox", "danger-full-access")),
         allowed_workspace_roots=[
             _path(item, Path.home()) for item in bridge.get("allowed_workspace_roots", [str(Path.home())])
         ],
@@ -168,6 +216,13 @@ def load_config(path: str | Path | None = None) -> BridgeConfig:
             owner_user_id=str(feishu.get("owner_user_id", "")),
             owner_union_id=str(feishu.get("owner_union_id", "")),
             pairing_code_ttl_seconds=int(feishu.get("pairing_code_ttl_seconds", 900)),
+        ),
+        daily_stats=DailyStatsConfig(
+            enabled=bool(daily_stats.get("enabled", False)),
+            spreadsheet_token=str(daily_stats.get("spreadsheet_token", "")).strip(),
+            sheet_id=str(daily_stats.get("sheet_id", "")).strip(),
+            timezone=str(daily_stats.get("timezone", "Asia/Shanghai")).strip()
+            or "Asia/Shanghai",
         ),
     )
     cfg.prepare_dirs()

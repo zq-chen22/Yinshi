@@ -106,6 +106,7 @@ class TurnJob:
     chat_id: str
     progress_message_id: str | None
     state: str
+    created_at: int = 0
 
 
 @dataclass(slots=True)

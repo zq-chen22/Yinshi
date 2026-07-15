@@ -88,11 +88,7 @@ class FakeCodex:
 
     async def compact_thread(self, thread_id: str) -> None:
         self.compacted_threads.append(thread_id)
-        turn = {
-            "id": f"compact-{len(self.compacted_threads)}",
-            "status": "completed",
-            "items": [],
-        }
+        turn = {"id": f"compact-{len(self.compacted_threads)}", "status": "completed", "items": []}
         for handler in self.notification_handlers:
             await handler(
                 {
@@ -211,6 +207,39 @@ class StaleInProgressCodex(FakeCodex):
         }
 
 
+class HangingCompactionCodex(FakeCodex):
+    def __init__(self) -> None:
+        super().__init__()
+        self.requested = False
+        self.terminal = False
+
+    async def compact_thread(self, thread_id: str) -> None:
+        self.compacted_threads.append(thread_id)
+        self.requested = True
+
+    async def read_thread(self, thread_id: str, **_: Any) -> dict[str, Any]:
+        return {
+            "id": thread_id,
+            "status": {"type": "idle" if self.terminal or not self.requested else "active"},
+            "path": None,
+            "turns": [],
+        }
+
+    async def list_turns(self, thread_id: str, **_: Any) -> dict[str, Any]:
+        if not self.terminal:
+            return {"data": [], "nextCursor": None}
+        return {
+            "data": [
+                {
+                    "id": "compact-late",
+                    "status": "completed",
+                    "items": [{"id": "context", "type": "contextCompaction"}],
+                }
+            ],
+            "nextCursor": None,
+        }
+
+
 class ThreadStartCrashCodex(FakeCodex):
     def __init__(self, db: BridgeDB, message_id: str) -> None:
         super().__init__()
@@ -253,42 +282,63 @@ class ThreadHistoryCodex(FakeCodex):
         return {"id": thread_id, "status": {"type": "idle"}, "turns": self.turns}
 
 
+class RestartContinuationCodex(ThreadHistoryCodex):
+    def __init__(self) -> None:
+        super().__init__(
+            [
+                {
+                    "id": "turn-before-restart",
+                    "status": "interrupted",
+                    "items": [
+                        {
+                            "type": "agentMessage",
+                            "phase": "commentary",
+                            "text": "已经完成了一部分现场工作",
+                        }
+                    ],
+                }
+            ]
+        )
+        self.started_inputs: list[list[dict[str, Any]]] = []
+
+    async def start_turn(
+        self, thread_id: str, inputs: list[dict[str, Any]], **_: Any
+    ) -> dict[str, Any]:
+        self.started_inputs.append(inputs)
+        turn = {
+            "id": "turn-after-restart",
+            "status": "completed",
+            "items": [
+                {
+                    "type": "agentMessage",
+                    "phase": "final_answer",
+                    "text": "恢复后完成并正常汇报",
+                }
+            ],
+        }
+        self.turns.append(turn)
+        for handler in self.notification_handlers:
+            await handler(
+                {
+                    "method": "turn/started",
+                    "params": {
+                        "threadId": thread_id,
+                        "turn": {"id": "turn-after-restart"},
+                    },
+                }
+            )
+            await handler(
+                {
+                    "method": "turn/completed",
+                    "params": {"threadId": thread_id, "turn": turn},
+                }
+            )
+        return turn
+
+
 class ExternalActiveCodex(FakeCodex):
     async def read_thread(self, thread_id: str, **_: Any) -> dict[str, Any]:
         return {"id": thread_id, "status": {"type": "active"}, "turns": []}
-
-
-class HangingCompactionCodex(FakeCodex):
-    def __init__(self) -> None:
-        super().__init__()
-        self.requested = False
-        self.terminal = False
-
-    async def compact_thread(self, thread_id: str) -> None:
-        self.compacted_threads.append(thread_id)
-        self.requested = True
-
-    async def read_thread(self, thread_id: str, **_: Any) -> dict[str, Any]:
-        return {
-            "id": thread_id,
-            "status": {"type": "idle" if self.terminal or not self.requested else "active"},
-            "path": None,
-            "turns": [],
-        }
-
-    async def list_turns(self, thread_id: str, **_: Any) -> dict[str, Any]:
-        if not self.terminal:
-            return {"data": [], "nextCursor": None}
-        return {
-            "data": [
-                {
-                    "id": "compact-late",
-                    "status": "completed",
-                    "items": [{"id": "context", "type": "contextCompaction"}],
-                }
-            ],
-            "nextCursor": None,
-        }
 
 
 class SummaryOnlyCodex(FakeCodex):
@@ -321,7 +371,6 @@ class FakeGateway:
         self.history: list[IncomingMessage] = []
         self.history_calls: list[dict[str, Any]] = []
         self.downloads: list[tuple[AppRole, Attachment]] = []
-        self.chat_updates: list[dict[str, Any]] = []
 
     def configured(self, role: AppRole) -> bool:
         return role in self.configured_roles
@@ -362,33 +411,6 @@ class FakeGateway:
     ) -> tuple[bytes, str]:
         self.downloads.append((role, attachment))
         return b"staged attachment", attachment.name
-
-    async def find_conversation_chat(
-        self, thread_id: str, owner_open_id: str
-    ) -> tuple[str, str] | None:
-        return None
-
-    async def create_conversation_chat(
-        self,
-        thread_id: str,
-        title: str,
-        owner_open_id: str,
-        cwd: str,
-        created_at: int,
-    ) -> tuple[str, str]:
-        return f"oc-{thread_id}", title
-
-    async def update_conversation_chat_description(
-        self, chat_id: str, thread_id: str, cwd: str, created_at: int
-    ) -> None:
-        self.chat_updates.append(
-            {
-                "chat_id": chat_id,
-                "thread_id": thread_id,
-                "cwd": cwd,
-                "created_at": created_at,
-            }
-        )
 
     async def list_chat_messages(
         self,
@@ -468,7 +490,7 @@ def bind_thread(db: BridgeDB, *, thread_id: str = "thread-1", chat_id: str = "oc
             thread_id=thread_id,
             name="受控对话",
             preview="",
-            cwd="/home/tester",
+            cwd="/home/galbot",
             created_at=1,
             updated_at=2,
             source_kind="cli",
@@ -660,6 +682,86 @@ async def test_recovery_poll_finalizes_terminal_turn_still_marked_active(
         outbound = db.claim_outbox("test-worker")
         assert outbound is not None
         assert outbound.content == {"text": "已保存的最终回复"}
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_startup_continues_interrupted_bridge_turn_without_external_echo(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path, owner_conversation_open_id="ou_conversation_owner")
+    db = BridgeDB(config.database_path)
+    codex = RestartContinuationCodex()
+    gateway = FakeGateway()
+    service = BridgeService(config, db, codex, gateway)  # type: ignore[arg-type]
+    bind_thread(db)
+    db.upsert_turn_job(
+        TurnJob(
+            message_id="om-before-restart",
+            thread_id="thread-1",
+            turn_id="turn-before-restart",
+            app_role="conversation",
+            chat_id="oc_thread",
+            progress_message_id="card-before-restart",
+            state="accepted",
+        )
+    )
+    summary = ThreadSummary(
+        thread_id="thread-1",
+        name="受控对话",
+        preview="",
+        cwd="/home/galbot",
+        created_at=1,
+        updated_at=2,
+        source_kind="cli",
+    )
+    db.set_setting("external_sync_initialized:thread-1", "1")
+
+    try:
+        await service._recover_turn_jobs(startup=True)
+
+        assert db.is_turn_synced("thread-1", "turn-before-restart") is True
+        assert db.is_bridge_turn("turn-after-restart") is True
+        assert db.list_recoverable_turn_jobs() == []
+        assert "系统恢复指令" in codex.started_inputs[0][0]["text"]
+        assert "om-before-restart" not in codex.started_inputs[0][0]["text"]
+        outbound = db.claim_outbox("restart-test")
+        assert outbound is not None
+        assert outbound.content == {"text": "恢复后完成并正常汇报"}
+        db.complete_outbox(
+            outbound.outbox_key,
+            thread_id=outbound.thread_id,
+            turn_id=outbound.turn_id,
+        )
+
+        await service._sync_external_updates([summary])
+        assert db.claim_outbox("restart-test-2") is None
+        assert len(gateway.patches) >= 2
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_graceful_drain_waits_for_accepted_turn_to_finish(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    db = BridgeDB(config.database_path)
+    service = BridgeService(config, db, FakeCodex(), FakeGateway())  # type: ignore[arg-type]
+    active = ActiveTurn(
+        thread_id="thread-draining",
+        turn_id="turn-draining",
+        chat_id="oc-draining",
+    )
+    service._register_active(active)
+    try:
+        waiter = asyncio.create_task(service.wait_for_drain(1.0))
+        await asyncio.sleep(0.02)
+        assert service._draining is True
+        assert waiter.done() is False
+
+        service._active_by_turn.pop(active.turn_id)
+        service._active_by_thread.pop(active.thread_id)
+        assert await waiter is True
     finally:
         db.close()
 
@@ -1190,8 +1292,8 @@ async def test_repair_card_exercises_protocol_and_unlocks_cli_settings(
         assert codex.started_threads == [
             {
                 "cwd": str(config.admin_scratch_dir),
-                "approval_policy": "on-request",
-                "sandbox": "workspace-write",
+                "approval_policy": "never",
+                "sandbox": "danger-full-access",
                 "model": None,
                 "service_tier": None,
                 "ephemeral": True,
@@ -1258,8 +1360,8 @@ async def test_global_runtime_defaults_cover_new_scopes_and_can_be_overridden(
             model="gpt-test",
             effort="high",
             service_tier="priority",
-            approval_policy="on-request",
-            sandbox="workspace-write",
+            approval_policy="never",
+            sandbox="danger-full-access",
         )
         assert service._runtime_settings("admin").model == "gpt-test"
 
@@ -1395,46 +1497,6 @@ async def test_reconcile_never_binds_orphan_from_admin_scratch(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
-async def test_reconcile_updates_existing_chat_description_once(tmp_path: Path) -> None:
-    config = make_config(
-        tmp_path,
-        owner_conversation_open_id="ou_conversation_owner",
-    )
-    db = BridgeDB(config.database_path)
-    summary = ThreadSummary(
-        thread_id="thread-normal",
-        name="正常对话",
-        preview="",
-        cwd=str(tmp_path / "project"),
-        created_at=1_700_000_000,
-        updated_at=1_700_000_100,
-        source_kind="cli",
-    )
-    db.upsert_thread(summary)
-    db.bind_chat(summary.thread_id, "oc-existing")
-    gateway = FakeGateway(configured_roles={"conversation"})
-    service = BridgeService(
-        config,
-        db,
-        StaticThreadsCodex([summary]),
-        gateway,  # type: ignore[arg-type]
-    )
-    try:
-        await service.reconcile_once()
-        await service.reconcile_once()
-        assert gateway.chat_updates == [
-            {
-                "chat_id": "oc-existing",
-                "thread_id": "thread-normal",
-                "cwd": str(tmp_path / "project"),
-                "created_at": 1_700_000_000,
-            }
-        ]
-    finally:
-        db.close()
-
-
-@pytest.mark.asyncio
 async def test_approval_command_returns_exact_permissions_payload(tmp_path: Path) -> None:
     config = make_config(
         tmp_path,
@@ -1552,6 +1614,44 @@ async def test_history_backfill_overlaps_and_dedupes_by_message_id(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_history_backfill_waits_for_adaptive_due_time(tmp_path: Path) -> None:
+    config = make_config(
+        tmp_path,
+        owner_conversation_open_id="ou_conversation_owner",
+    )
+    db = BridgeDB(config.database_path)
+    gateway = FakeGateway(configured_roles={"conversation"})
+    service = BridgeService(config, db, FakeCodex(), gateway)  # type: ignore[arg-type]
+    bind_thread(db)
+    try:
+        await service._backfill_once(force=True)
+        await service._backfill_once(force=False)
+        assert len(gateway.history_calls) == 1
+        assert service._history_next_poll[("conversation", "oc_thread")] > 0
+    finally:
+        db.close()
+
+
+def test_history_poll_slows_for_inactive_conversations(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    db = BridgeDB(config.database_path)
+    service = BridgeService(config, db, FakeCodex(), FakeGateway())  # type: ignore[arg-type]
+    now = 2_000_000.0
+    recent = incoming("recent", chat_id="recent", create_time_ms=int((now - 60) * 1000))
+    warm = incoming("warm", chat_id="warm", create_time_ms=int((now - 7 * 3600) * 1000))
+    idle = incoming("idle", chat_id="idle", create_time_ms=int((now - 2 * 86400) * 1000))
+    for message in (recent, warm, idle):
+        assert db.enqueue_incoming(message)
+    try:
+        assert service._history_poll_interval("conversation", "recent", now) == 600
+        assert service._history_poll_interval("conversation", "warm", now) == 1800
+        assert service._history_poll_interval("conversation", "idle", now) == 3600
+        assert service._history_poll_interval("conversation", "never-seen", now) == 7200
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
 async def test_external_sync_baselines_history_before_delivering_new_turns(tmp_path: Path) -> None:
     config = make_config(tmp_path)
     db = BridgeDB(config.database_path)
@@ -1573,7 +1673,7 @@ async def test_external_sync_baselines_history_before_delivering_new_turns(tmp_p
         thread_id="thread-1",
         name="受控对话",
         preview="",
-        cwd="/home/tester",
+        cwd="/home/galbot",
         created_at=1,
         updated_at=2,
         source_kind="cli",
@@ -1744,6 +1844,7 @@ async def test_progress_patch_failure_backs_off_instead_of_hot_looping(
 
     config = make_config(tmp_path)
     config.progress_update_seconds = 0.01
+    config.progress_steady_update_seconds = 0.01
     db = BridgeDB(config.database_path)
     gateway = FailingPatchGateway()
     service = BridgeService(config, db, FakeCodex(), gateway)  # type: ignore[arg-type]
@@ -1757,7 +1858,7 @@ async def test_progress_patch_failure_backs_off_instead_of_hot_looping(
     service._register_active(active)
     task = asyncio.create_task(service._progress_loop())
     try:
-        await asyncio.sleep(0.08)
+        await asyncio.sleep(0.3)
         assert gateway.attempts == 1
         assert active.progress_failures == 1
         assert active.progress_retry_monotonic > 0
@@ -1874,7 +1975,7 @@ async def test_token_usage_triggers_native_compaction_and_resets_threshold(
 
         turn = await service._compact_thread(
             "thread-1",
-            RuntimeSettings(None, None, None, "on-request", "workspace-write"),
+            RuntimeSettings(None, None, None, "never", "danger-full-access"),
         )
 
         assert turn["status"] == "completed"
@@ -1888,7 +1989,7 @@ async def test_token_usage_triggers_native_compaction_and_resets_threshold(
 @pytest.mark.asyncio
 async def test_compaction_refuses_bridge_or_external_active_turn(tmp_path: Path) -> None:
     config = make_config(tmp_path)
-    runtime = RuntimeSettings(None, None, None, "on-request", "workspace-write")
+    runtime = RuntimeSettings(None, None, None, "never", "danger-full-access")
 
     db = BridgeDB(config.database_path)
     service = BridgeService(config, db, FakeCodex(), FakeGateway())  # type: ignore[arg-type]
@@ -1918,7 +2019,8 @@ async def test_compaction_ignores_unrelated_completed_turn_until_context_item(
 ) -> None:
     config = make_config(tmp_path)
     db = BridgeDB(config.database_path)
-    service = BridgeService(config, db, FakeCodex(), FakeGateway())  # type: ignore[arg-type]
+    codex = FakeCodex()
+    service = BridgeService(config, db, codex, FakeGateway())  # type: ignore[arg-type]
     waiter: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
     service._compaction_waiters["thread-1"] = waiter
     try:
@@ -2027,7 +2129,7 @@ async def test_uncertain_compaction_is_persisted_and_blocks_auto_turn(
         with pytest.raises(TimeoutError):
             await service._maybe_auto_compact(
                 "thread-1",
-                RuntimeSettings(None, None, None, "on-request", "workspace-write"),
+                RuntimeSettings(None, None, None, "never", "danger-full-access"),
                 job,
             )
         assert service._compaction_state("thread-1") is not None
@@ -2058,7 +2160,7 @@ async def test_status_and_turn_recovery_never_load_full_image_history(
         assert turns[0]["id"] == "turn-summary"
         await service._compact_thread(
             "thread-1",
-            RuntimeSettings(None, None, None, "on-request", "workspace-write"),
+            RuntimeSettings(None, None, None, "never", "danger-full-access"),
         )
         assert codex.compacted_threads == ["thread-1"]
     finally:
@@ -2080,5 +2182,23 @@ def test_progress_text_is_stable_inside_heartbeat_bucket(tmp_path: Path) -> None
         first = service._render_progress(active)
         second = service._render_progress(active)
         assert first == second
+    finally:
+        db.close()
+
+
+def test_progress_uses_five_seconds_then_thirty_seconds(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    db = BridgeDB(config.database_path)
+    service = BridgeService(config, db, FakeCodex(), FakeGateway())  # type: ignore[arg-type]
+    now = 10_000.0
+    early = ActiveTurn(
+        thread_id="early", turn_id="early", chat_id="early", started_monotonic=now - 60
+    )
+    steady = ActiveTurn(
+        thread_id="steady", turn_id="steady", chat_id="steady", started_monotonic=now - 121
+    )
+    try:
+        assert service._progress_interval(early, now) == 5
+        assert service._progress_interval(steady, now) == 30
     finally:
         db.close()

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
 from types import SimpleNamespace
 
 import pytest
@@ -12,7 +11,6 @@ from codex_feishu_bridge.feishu import (
     _normalize_card_action,
     _normalize_history_message,
     _normalize_message,
-    conversation_group_description,
     conversation_group_name,
     deterministic_uuid,
     progress_card,
@@ -62,25 +60,13 @@ def ws_message_event(
 
 
 def test_conversation_group_name_is_stable_sanitized_and_bounded() -> None:
-    suffix = "-测试主机"
+    suffix = "-鼎盛笔记本ubuntu"
     name = conversation_group_name("  很长的对话名\n" + "甲" * 100, suffix)
 
     assert name.endswith(suffix)
     assert "\n" not in name
     assert len(name) == 60
     assert conversation_group_name(" \t\n ", suffix) == f"Codex 对话{suffix}"
-
-
-def test_conversation_group_description_has_cwd_start_time_and_stable_marker() -> None:
-    description = conversation_group_description(
-        "thread-123", "/home/test/project\n", 1_700_000_000_123
-    )
-    lines = description.splitlines()
-
-    assert lines[0] == "目录：/home/test/project"
-    assert lines[1].startswith("开始：")
-    assert int(datetime.fromisoformat(lines[1].removeprefix("开始：")).timestamp()) == 1_700_000_000
-    assert lines[2] == "codex-thread:thread-123"
 
 
 def test_message_uuid_is_deterministic_but_namespaced() -> None:

@@ -124,6 +124,17 @@ CREATE TABLE IF NOT EXISTS turn_jobs (
     updated_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS api_call_usage (
+    period TEXT NOT NULL,
+    app_role TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    successes INTEGER NOT NULL DEFAULT 0,
+    failures INTEGER NOT NULL DEFAULT 0,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY(period, app_role, operation)
+);
+
 CREATE TABLE IF NOT EXISTS artifact_approvals (
     approval_id TEXT PRIMARY KEY,
     thread_id TEXT NOT NULL,
@@ -303,6 +314,52 @@ class BridgeDB:
             )
             self._conn.commit()
             return cur.rowcount == 1
+
+    def last_incoming_create_time_ms(self, app_role: str, chat_id: str) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT MAX(create_time_ms) AS latest FROM inbox_messages
+                   WHERE app_role=? AND chat_id=?""",
+                (app_role, chat_id),
+            ).fetchone()
+        return int(row["latest"] or 0) if row else 0
+
+    def record_api_attempt(self, app_role: str, operation: str) -> None:
+        now = int(time.time())
+        period = time.strftime("%Y-%m", time.localtime(now))
+        with self._lock:
+            self._conn.execute(
+                """INSERT INTO api_call_usage(
+                       period, app_role, operation, attempts, successes, failures, updated_at
+                   ) VALUES(?, ?, ?, 1, 0, 0, ?)
+                   ON CONFLICT(period, app_role, operation) DO UPDATE SET
+                       attempts=api_call_usage.attempts + 1,
+                       updated_at=excluded.updated_at""",
+                (period, app_role, operation, now),
+            )
+            self._conn.commit()
+
+    def record_api_result(self, app_role: str, operation: str, *, success: bool) -> None:
+        now = int(time.time())
+        period = time.strftime("%Y-%m", time.localtime(now))
+        column = "successes" if success else "failures"
+        with self._lock:
+            self._conn.execute(
+                f"""UPDATE api_call_usage SET {column}={column} + 1, updated_at=?
+                    WHERE period=? AND app_role=? AND operation=?""",
+                (now, period, app_role, operation),
+            )
+            self._conn.commit()
+
+    def api_usage(self, period: str | None = None) -> dict[str, int]:
+        selected = period or time.strftime("%Y-%m", time.localtime())
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT operation, SUM(attempts) AS attempts
+                   FROM api_call_usage WHERE period=? GROUP BY operation""",
+                (selected,),
+            ).fetchall()
+        return {str(row["operation"]): int(row["attempts"] or 0) for row in rows}
 
     @staticmethod
     def _incoming_payload(message: IncomingMessage) -> dict[str, Any]:
@@ -807,6 +864,15 @@ class BridgeDB:
             ).fetchone()
         return row is not None
 
+    def is_bridge_turn(self, turn_id: str) -> bool:
+        if not turn_id:
+            return False
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM turn_jobs WHERE turn_id=?", (turn_id,)
+            ).fetchone()
+        return row is not None
+
     def upsert_turn_job(self, job: TurnJob) -> None:
         now = int(time.time())
         with self._lock:
@@ -858,6 +924,7 @@ class BridgeDB:
                 chat_id=str(row["chat_id"]),
                 progress_message_id=row["progress_message_id"],
                 state=str(row["state"]),
+                created_at=int(row["created_at"]),
             )
             for row in rows
         ]

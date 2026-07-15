@@ -199,6 +199,9 @@ async def test_jsonl_client_filters_threads_and_dispatches_events(tmp_path):
 
         read = await client.read_thread("thread-1")
         assert read["id"] == "thread-1"
+        # Regression: live image-generation notifications can exceed the old
+        # 16 MiB asyncio StreamReader limit. The client must keep the JSONL
+        # connection intact for a valid response of that size.
         assert len(read["largePayload"]) == 17 * 1024 * 1024
 
         turns = await client.list_turns(

@@ -15,6 +15,7 @@ import httpx
 
 from .codex_client import CodexAppServer
 from .config import DEFAULT_CONFIG_DIR, BridgeConfig, load_config
+from .daily_stats import DailyStatsError, column_name, sync_daily_stats
 from .db import BridgeDB
 from .feishu import FeishuGateway
 from .models import ThreadSummary
@@ -23,6 +24,11 @@ from .service import BridgeService, generate_pairing_code
 
 LOG = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DEPLOYMENT_INITIAL_THREADS = {
+    "019f5563-9e7c-7603-82ef-5b0ca2170fd8": "飞书监督与操控 Codex",
+    "019f1c76-e474-7471-816a-971c3944ca66": "Codex 账户与环境检查",
+    "019ed59b-147a-7be2-9aa6-e0c27b613881": "创建触觉读取记录",
+}
 
 
 def parser() -> argparse.ArgumentParser:
@@ -44,6 +50,7 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser("pair-code", help="生成 15 分钟有效的 Codex 机器人配对码")
     commands.add_parser("bootstrap", help="凭据和配对就绪后创建待绑定的飞书对话群")
     commands.add_parser("run", help="以前台常驻方式运行长连接、执行和同步服务")
+    commands.add_parser("sync-daily-stats", help="同步今天和昨天的飞书触发 Codex 任务统计")
     return result
 
 
@@ -84,9 +91,28 @@ async def _main(args: argparse.Namespace) -> int:
             return await _bootstrap(config, db)
         if args.command == "run":
             return await _run(config, db)
+        if args.command == "sync-daily-stats":
+            return await _sync_daily_stats(config, db)
         raise AssertionError(args.command)
     finally:
         db.close()
+
+
+async def _sync_daily_stats(config: BridgeConfig, db: BridgeDB) -> int:
+    try:
+        result = await sync_daily_stats(config, db=db)
+    except DailyStatsError as error:
+        print(f"每日统计同步失败：{error}", file=sys.stderr)
+        return 1
+    left = column_name(result.column_start_index)
+    right = column_name(result.column_start_index + 1)
+    print(f"主机：{result.identity.hostname}（{result.identity.host_id}）")
+    print(f"机器人：{result.identity.bot_name}")
+    print(f"工作表：{result.sheet_title}；列组：{left}:{right}")
+    for count in result.counts:
+        print(f"{count.day.isoformat()}：总任务 {count.total}，长任务 {count.long}")
+    print("验证：读取成功；写入并回读成功；其他机器人列和历史数据保持不变。")
+    return 0
 
 
 async def _init(config: BridgeConfig, db: BridgeDB) -> int:
@@ -102,6 +128,16 @@ async def _init(config: BridgeConfig, db: BridgeDB) -> int:
         initial = threads[: config.initial_thread_count]
         for thread in initial:
             db.upsert_thread(thread, title=_suggest_title(thread))
+        # This installation was requested while these three threads were the
+        # initial recent set.  If another local task became recent during
+        # setup, retain the original three and also let the rolling watcher add
+        # the newcomer; old bindings are intentionally never deleted.
+        by_id = {thread.thread_id: thread for thread in threads}
+        for thread_id, title in DEPLOYMENT_INITIAL_THREADS.items():
+            thread = by_id.get(thread_id)
+            if thread:
+                db.upsert_thread(thread, title=title)
+                db.set_binding_title(thread_id, title)
     except Exception as error:
         print(f"初始化目录完成，但读取 Codex 对话失败：{error}", file=sys.stderr)
         return 1
@@ -189,7 +225,19 @@ async def _run(config: BridgeConfig, db: BridgeDB) -> int:
             LOG.error("Bridge stopped because a critical worker failed: %s", service.fatal_error)
             return_code = 1
         else:
-            return_code = 0
+            print("Codex 飞书桥正在排空已接单任务；新消息会由重启后的服务处理。", flush=True)
+            drained = await service.wait_for_drain(
+                config.shutdown_drain_timeout_seconds
+            )
+            if drained:
+                print("已接单任务及结果已排空，可以安全重启。", flush=True)
+                return_code = 0
+            else:
+                LOG.error(
+                    "Graceful shutdown timed out after %.0fs; active work may be interrupted",
+                    config.shutdown_drain_timeout_seconds,
+                )
+                return_code = 4
     finally:
         await service.stop()
         lock.release()

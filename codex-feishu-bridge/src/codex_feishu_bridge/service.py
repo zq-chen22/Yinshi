@@ -87,6 +87,7 @@ class BridgeService:
         self.artifacts = ArtifactBroker(config, gateway)
         self.worker_id = f"{uuid.uuid4()}"
         self._stop = asyncio.Event()
+        self._draining = False
         self.fatal_error: BaseException | None = None
         self._chat_description_retry_at: dict[str, float] = {}
         self._tasks: list[asyncio.Task[Any]] = []
@@ -98,6 +99,8 @@ class BridgeService:
         self._active_by_turn: dict[str, ActiveTurn] = {}
         self._turn_done: dict[str, asyncio.Event] = {}
         self._pending_jobs: dict[str, ScheduledMessage] = {}
+        self._pending_recoveries: dict[str, TurnJob] = {}
+        self._history_next_poll: dict[tuple[AppRole, str], float] = {}
         self._completed_turns: set[str] = set()
         self._finalizing: set[str] = set()
         self._progress_locks: dict[str, asyncio.Lock] = {}
@@ -115,7 +118,7 @@ class BridgeService:
         recovered_outbox = self.db.recover_outbox_after_restart()
         await self.codex.start()
         await self._probe_runtime_settings_compatibility()
-        await self._recover_turn_jobs()
+        await self._recover_turn_jobs(startup=True)
         self.gateway.start_receivers()
         await self.reconcile_once()
         try:
@@ -160,6 +163,36 @@ class BridgeService:
         self._background_tasks.clear()
         self.gateway.stop_receivers()
         await self.codex.close()
+
+    def begin_drain(self) -> None:
+        """Stop claiming new phone messages while already accepted work finishes."""
+
+        self._draining = True
+
+    def _drain_complete(self) -> bool:
+        queued = any(not queue.empty() for queue in self._thread_queues.values())
+        outbox = self.db.outbox_counts()
+        outbound_pending = any(
+            count for state, count in outbox.items() if state not in {"done", "dead"}
+        )
+        return not (
+            self._active_by_turn
+            or self._pending_jobs
+            or self._pending_recoveries
+            or self._finalizing
+            or queued
+            or not self._admin_queue.empty()
+            or outbound_pending
+        )
+
+    async def wait_for_drain(self, timeout_seconds: float) -> bool:
+        self.begin_drain()
+        deadline = time.monotonic() + max(0.0, timeout_seconds)
+        while not self._drain_complete():
+            if time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(0.25)
+        return True
 
     def _critical_task(self, awaitable: Any, name: str) -> asyncio.Task[Any]:
         task = asyncio.create_task(awaitable, name=name)
@@ -304,8 +337,8 @@ class BridgeService:
 
         ``thread/read(includeTurns=True)`` can serialize every persisted image
         into one JSON line. A handful of generated images is enough to block
-        or exceed an app-server stream limit, so polling and recovery use the
-        paginated summary API instead.
+        or exceed the app-server stream limit, so polling and recovery must use
+        the paginated summary API instead.
         """
 
         turns: list[dict[str, Any]] = []
@@ -414,6 +447,7 @@ class BridgeService:
                     if (
                         not turn_id
                         or turn.get("status") not in {"completed", "failed", "interrupted"}
+                        or self.db.is_bridge_turn(turn_id)
                         or self.db.is_turn_synced(thread.thread_id, turn_id)
                     ):
                         continue
@@ -456,6 +490,8 @@ class BridgeService:
     async def _reconcile_loop(self) -> None:
         while not self._stop.is_set():
             await asyncio.sleep(self.config.sync_interval_seconds)
+            if self._draining:
+                continue
             try:
                 await self.reconcile_once()
             except Exception:
@@ -494,20 +530,29 @@ class BridgeService:
                     LOG.exception("Could not recover active turn %s", active.turn_id)
                     await self._mark_lost_turn(active)
 
-    async def _recover_turn_jobs(self) -> None:
+    async def _recover_turn_jobs(self, *, startup: bool = False) -> None:
         for job in self.db.list_recoverable_turn_jobs():
             known_active = self._active_by_turn.get(job.turn_id)
+            age = max(0, int(time.time()) - job.created_at) if job.created_at else 0
             active = known_active or ActiveTurn(
                 thread_id=job.thread_id,
                 turn_id=job.turn_id,
                 chat_id=job.chat_id,
                 app_role=job.app_role,
                 progress_message_id=job.progress_message_id,
-                started_monotonic=time.monotonic(),
+                started_monotonic=time.monotonic() - age,
             )
             try:
                 turn = await self._find_turn_summary(job.thread_id, job.turn_id)
                 if turn and turn.get("status") in {"completed", "failed", "interrupted"}:
+                    _, final_messages = extract_agent_messages(turn)
+                    if (
+                        startup
+                        and turn.get("status") == "interrupted"
+                        and not final_messages
+                    ):
+                        await self._continue_interrupted_turn(job)
+                        continue
                     if known_active is None:
                         self._register_active(active)
                     await self._finalize_turn(active, turn)
@@ -518,10 +563,104 @@ class BridgeService:
                 if known_active is None:
                     await self._mark_lost_turn(active)
 
+    async def _continue_interrupted_turn(self, job: TurnJob) -> None:
+        """Continue bridge-owned work interrupted by an App Server restart.
+
+        The continuation inspects the existing thread/workspace instead of
+        replaying the original user text, so completed side effects are not
+        blindly repeated and the phone never receives an echo of its prompt.
+        """
+
+        old_turn_id = job.turn_id
+        self.db.mark_turn_synced(job.thread_id, old_turn_id)
+        self._pending_recoveries[job.thread_id] = job
+        if job.progress_message_id:
+            with contextlib.suppress(Exception):
+                await self.gateway.patch_card(
+                    job.app_role,
+                    job.progress_message_id,
+                    progress_card(
+                        "Codex 正在恢复",
+                        "桥服务更新打断了上一执行进程；已保留原对话和工作目录，"
+                        "正在检查现场并从未完成处继续。",
+                        color="orange",
+                    ),
+                )
+        runtime = self._runtime_settings(job.thread_id)
+        recovery_id = str(
+            uuid.uuid5(uuid.NAMESPACE_URL, f"codex-feishu-recovery:{old_turn_id}")
+        )
+        instruction = (
+            "系统恢复指令：飞书桥在上一轮执行过程中重启，上一轮因此被基础设施中断。"
+            "请根据本对话中紧邻的上一条用户要求和当前工作目录中的已有现场继续完成任务。"
+            "先检查已经产生的文件、进程与结果，避免重复已完成的副作用；"
+            "不要复述用户原文，不要只报告中断。完成后给出正常的最终汇报。"
+        )
+        try:
+            turn = await self.codex.start_turn(
+                job.thread_id,
+                [{"type": "text", "text": instruction, "text_elements": []}],
+                client_message_id=recovery_id,
+                approval_policy=runtime.approval_policy,
+                sandbox=runtime.sandbox,
+                model=runtime.model,
+                effort=runtime.effort,
+                service_tier=runtime.service_tier,
+            )
+            turn_id = str(turn.get("id") or "")
+            if not turn_id:
+                raise RuntimeError("recovery turn/start returned no id")
+            if turn_id in self._completed_turns:
+                return
+            self.db.upsert_turn_job(
+                TurnJob(
+                    message_id=job.message_id,
+                    thread_id=job.thread_id,
+                    turn_id=turn_id,
+                    app_role=job.app_role,
+                    chat_id=job.chat_id,
+                    progress_message_id=job.progress_message_id,
+                    state="accepted",
+                )
+            )
+            if turn_id not in self._active_by_turn:
+                self._register_active(
+                    ActiveTurn(
+                        thread_id=job.thread_id,
+                        turn_id=turn_id,
+                        chat_id=job.chat_id,
+                        app_role=job.app_role,
+                        progress_message_id=job.progress_message_id,
+                        started_monotonic=time.monotonic(),
+                    )
+                )
+        except Exception:
+            LOG.exception("Could not continue interrupted turn %s", old_turn_id)
+            active = ActiveTurn(
+                thread_id=job.thread_id,
+                turn_id=old_turn_id,
+                chat_id=job.chat_id,
+                app_role=job.app_role,
+                progress_message_id=job.progress_message_id,
+                started_monotonic=time.monotonic(),
+            )
+            self._register_active(active)
+            await self._finalize_turn(
+                active,
+                {
+                    "id": old_turn_id,
+                    "status": "interrupted",
+                    "items": [],
+                    "error": {"message": "桥服务重启后的自动续做未能启动"},
+                },
+            )
+        finally:
+            self._pending_recoveries.pop(job.thread_id, None)
+
     async def _turn_recovery_loop(self) -> None:
         while not self._stop.is_set():
             await asyncio.sleep(60)
-            await self._recover_turn_jobs()
+            await self._recover_turn_jobs(startup=False)
 
     async def _mark_lost_turn(self, active: ActiveTurn) -> None:
         self.db.set_turn_job_state(active.turn_id, "ambiguous")
@@ -559,9 +698,14 @@ class BridgeService:
             restarted = self.gateway.ensure_receivers()
             if restarted:
                 LOG.warning("Restarted Feishu WS receiver(s): %s", ", ".join(restarted))
+                with contextlib.suppress(Exception):
+                    await self._backfill_once(force=True)
 
     async def _inbox_loop(self) -> None:
         while not self._stop.is_set():
+            if self._draining:
+                await asyncio.sleep(0.25)
+                continue
             item = self.db.claim_incoming(self.worker_id, lease_seconds=24 * 3600)
             if not item:
                 await asyncio.sleep(0.25)
@@ -795,16 +939,18 @@ class BridgeService:
 
     async def _history_loop(self) -> None:
         while not self._stop.is_set():
-            await asyncio.sleep(60)
+            await asyncio.sleep(15)
+            if self._draining:
+                continue
             try:
-                await self._backfill_once()
+                await self._backfill_once(force=False)
             except Exception as error:
                 key = f"history:{type(error).__name__}:{error}"
                 if key not in self._warned:
                     self._warned.add(key)
                     LOG.exception("Feishu history recovery failed")
 
-    async def _backfill_once(self) -> None:
+    def _history_chats(self) -> list[tuple[AppRole, str]]:
         chats: list[tuple[AppRole, str]] = []
         private_chat = self.db.get_setting("owner_chat_id:conversation", "") or ""
         if (
@@ -819,23 +965,59 @@ class BridgeService:
                 for binding in self.db.list_bindings()
                 if binding.chat_id and ("conversation", binding.chat_id) not in chats
             )
+        return chats
+
+    def _history_poll_interval(self, role: AppRole, chat_id: str, now: float) -> float:
+        if any(active.chat_id == chat_id for active in self._active_by_turn.values()):
+            return self.config.history_poll_seconds
+        latest_ms = self.db.last_incoming_create_time_ms(role, chat_id)
+        age = float("inf") if latest_ms <= 0 else max(0.0, now - latest_ms / 1000)
+        if age >= self.config.history_cold_after_seconds:
+            return self.config.history_poll_cold_seconds
+        if age >= self.config.history_idle_after_seconds:
+            return self.config.history_poll_idle_seconds
+        if age >= self.config.history_warm_after_seconds:
+            return self.config.history_poll_warm_seconds
+        return self.config.history_poll_seconds
+
+    @staticmethod
+    def _history_stagger_seconds(chat_id: str, interval: float) -> float:
+        window = max(1, min(60, int(interval * 0.1)))
+        value = int(hashlib.sha256(chat_id.encode()).hexdigest()[:8], 16)
+        return float(value % window)
+
+    async def _backfill_once(self, *, force: bool = True) -> None:
+        chats = self._history_chats()
         end_seconds = int(time.time())
         end_ms = end_seconds * 1000
         for role, chat_id in chats:
+            schedule_key = (role, chat_id)
+            if not force and time.monotonic() < self._history_next_poll.get(
+                schedule_key, 0.0
+            ):
+                continue
             key = f"history_checkpoint:{role}:{chat_id}"
             checkpoint_ms = int(self.db.get_setting(key, "0") or 0)
             if checkpoint_ms <= 0:
                 checkpoint_ms = end_ms - 5 * 60 * 1000
-            messages = await self.gateway.list_chat_messages(
-                role,
-                chat_id,
-                start_time_seconds=max(0, checkpoint_ms // 1000 - 1),
-                end_time_seconds=end_seconds,
-            )
-            for message in messages:
-                self.db.enqueue_incoming(message)
-            # Advance only after the full paginated scan and durable inserts.
-            self.db.set_setting(key, str(end_ms))
+            try:
+                messages = await self.gateway.list_chat_messages(
+                    role,
+                    chat_id,
+                    start_time_seconds=max(0, checkpoint_ms // 1000 - 1),
+                    end_time_seconds=end_seconds,
+                )
+                for message in messages:
+                    self.db.enqueue_incoming(message)
+                # Advance only after the full paginated scan and durable inserts.
+                self.db.set_setting(key, str(end_ms))
+            finally:
+                interval = self._history_poll_interval(role, chat_id, time.time())
+                self._history_next_poll[schedule_key] = (
+                    time.monotonic()
+                    + interval
+                    + self._history_stagger_seconds(chat_id, interval)
+                )
 
     def _authorized(self, message: IncomingMessage) -> bool:
         owner = self._owner(message.app_role)
@@ -1018,7 +1200,7 @@ class BridgeService:
                 "• `/permissions`：选择权限预设\n"
                 "• `/status`：查看当前会话配置\n"
                 "• `/compat`：检测并修复 CLI 设置兼容门禁\n"
-                "• `/compact`：在对话空闲时原生压缩长上下文\n"
+                "• `/compact`：在会话空闲时原生压缩长上下文\n"
                 "飞书会用按钮代替终端里的选择弹窗。"
             )
         elif kind in {"配置", "设置", "状态"}:
@@ -1677,7 +1859,7 @@ class BridgeService:
             raise RuntimeError("thread compaction is already running")
         await self._settle_prior_compaction(thread_id)
         # Native compaction replaces any task that is already active on the
-        # thread. A task may have been started from the local CLI rather than
+        # thread.  A task may have been started from the local CLI rather than
         # through this bridge, so the in-memory active map is not sufficient.
         # Use the bounded/image-free APIs for a final preflight before sending
         # the destructive-to-an-active-turn compact RPC.
@@ -1789,10 +1971,7 @@ class BridgeService:
         try:
             await self._compact_thread(thread_id, runtime)
         except Exception:
-            LOG.exception(
-                "Automatic compaction did not reach a proven terminal state for %s",
-                thread_id,
-            )
+            LOG.exception("Automatic compaction did not reach a proven terminal state for %s", thread_id)
             with contextlib.suppress(Exception):
                 await self.gateway.patch_card(
                     job.app_role,
@@ -2078,10 +2257,19 @@ class BridgeService:
         if text in {"状态", "/status"}:
             counts = self.db.inbox_counts()
             receivers = self.gateway.receiver_status()
+            api_usage = self.db.api_usage()
+            api_total = sum(api_usage.values())
+            api_top = ", ".join(
+                f"{name}={count}"
+                for name, count in sorted(
+                    api_usage.items(), key=lambda item: item[1], reverse=True
+                )[:4]
+            ) or "尚无记录"
             reply = (
                 f"服务运行中；活动 Codex：{len(self._active_by_thread)}；"
                 f"收件箱：{counts or {'empty': 0}}；"
-                f"发件箱：{self.db.outbox_counts() or {'empty': 0}}；长连接：{receivers}。"
+                f"发件箱：{self.db.outbox_counts() or {'empty': 0}}；长连接：{receivers}。\n"
+                f"本月桥内已记录飞书 API：{api_total} 次（{api_top}）。"
             )
             await self._admin_reply(message, reply, "bridge-status")
             self.db.complete_incoming(message.message_id)
@@ -2291,19 +2479,31 @@ class BridgeService:
 
     async def _progress_loop(self) -> None:
         while not self._stop.is_set():
-            await asyncio.sleep(self.config.progress_update_seconds)
+            await asyncio.sleep(
+                max(
+                    0.25,
+                    min(
+                        self.config.progress_update_seconds,
+                        self.config.progress_steady_update_seconds,
+                    ),
+                )
+            )
+            if self._stop.is_set():
+                return
             for active in list(self._active_by_turn.values()):
                 if not active.progress_message_id:
                     continue
-                rendered = self._render_progress(active)
                 now = time.monotonic()
                 if now < active.progress_retry_monotonic:
                     continue
+                minimum_interval = self._progress_interval(active, now)
                 if (
-                    rendered == active.last_progress_text
-                    and now - active.last_progress_monotonic
-                    < self.config.progress_heartbeat_seconds
+                    active.last_progress_monotonic
+                    and now - active.last_progress_monotonic < minimum_interval
                 ):
+                    continue
+                rendered = self._render_progress(active, now=now)
+                if rendered == active.last_progress_text:
                     continue
                 try:
                     patched = await self._patch_active_progress(
@@ -2358,16 +2558,28 @@ class BridgeService:
                 self._terminal_progress_messages.add(message_id)
             return True
 
-    def _render_progress(self, active: ActiveTurn) -> str:
-        elapsed = int(max(0, time.monotonic() - active.started_monotonic))
-        heartbeat = max(1, int(self.config.progress_heartbeat_seconds))
+    def _progress_interval(
+        self, active: ActiveTurn, now: float | None = None
+    ) -> float:
+        current = time.monotonic() if now is None else now
+        age = max(0.0, current - active.started_monotonic)
+        if age < self.config.progress_initial_window_seconds:
+            return max(0.25, self.config.progress_update_seconds)
+        return max(0.25, self.config.progress_steady_update_seconds)
+
+    def _render_progress(
+        self, active: ActiveTurn, *, now: float | None = None
+    ) -> str:
+        current = time.monotonic() if now is None else now
+        elapsed = int(max(0, current - active.started_monotonic))
+        heartbeat = max(1, int(self._progress_interval(active, current)))
         displayed_elapsed = elapsed - elapsed % heartbeat
         lines = [
             f"**已运行：** {displayed_elapsed // 60:02d}:"
             f"{displayed_elapsed % 60:02d}"
         ]
         last_event = active.last_event_monotonic or active.started_monotonic
-        quiet = int(max(0, time.monotonic() - last_event))
+        quiet = int(max(0, current - last_event))
         if quiet >= self.config.progress_stale_seconds:
             quiet_display = quiet - quiet % heartbeat
             lines.extend(
@@ -2508,6 +2720,29 @@ class BridgeService:
                             state="running",
                         )
                     )
+                else:
+                    recovery = self._pending_recoveries.get(thread_id)
+                    if recovery:
+                        active = ActiveTurn(
+                            thread_id=thread_id,
+                            turn_id=turn_id,
+                            chat_id=recovery.chat_id,
+                            app_role=recovery.app_role,
+                            progress_message_id=recovery.progress_message_id,
+                            started_monotonic=time.monotonic(),
+                        )
+                        self._register_active(active)
+                        self.db.upsert_turn_job(
+                            TurnJob(
+                                message_id=recovery.message_id,
+                                thread_id=thread_id,
+                                turn_id=turn_id,
+                                app_role=recovery.app_role,
+                                chat_id=recovery.chat_id,
+                                progress_message_id=recovery.progress_message_id,
+                                state="running",
+                            )
+                        )
             return
         if method == "configWarning":
             warning = str(params.get("message") or params.get("detail") or params)
@@ -2529,6 +2764,30 @@ class BridgeService:
                 )
                 self._register_active(active)
                 await self._finalize_turn(active, turn_raw)
+            else:
+                recovery = self._pending_recoveries.get(thread_id)
+                if recovery:
+                    active = ActiveTurn(
+                        thread_id=thread_id,
+                        turn_id=turn_id,
+                        chat_id=recovery.chat_id,
+                        app_role=recovery.app_role,
+                        progress_message_id=recovery.progress_message_id,
+                        started_monotonic=time.monotonic(),
+                    )
+                    self._register_active(active)
+                    self.db.upsert_turn_job(
+                        TurnJob(
+                            message_id=recovery.message_id,
+                            thread_id=thread_id,
+                            turn_id=turn_id,
+                            app_role=recovery.app_role,
+                            chat_id=recovery.chat_id,
+                            progress_message_id=recovery.progress_message_id,
+                            state="running",
+                        )
+                    )
+                    await self._finalize_turn(active, turn_raw)
             return
         if not active:
             return
@@ -3032,6 +3291,8 @@ class BridgeService:
             )
 
     def _register_active(self, active: ActiveTurn) -> None:
+        if not active.started_monotonic:
+            active.started_monotonic = time.monotonic()
         if not active.last_event_monotonic:
             active.last_event_monotonic = time.monotonic()
         if not active.last_event_name:

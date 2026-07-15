@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -213,8 +214,9 @@ class FeishuGateway:
             .request_body(body)
             .build()
         )
-        response = await client.im.v1.message.acreate(request)
-        self._require_success(response, f"send {msg_type}")
+        response = await self._api_call(
+            role, f"message.send.{msg_type}", client.im.v1.message.acreate(request)
+        )
         message_id = getattr(response.data, "message_id", None)
         if not message_id:
             raise FeishuAPIError("Feishu send succeeded without a message_id")
@@ -233,8 +235,11 @@ class FeishuGateway:
             )
             .build()
         )
-        response = await self._client(role).im.v1.message.apatch(request)
-        self._require_success(response, "patch card")
+        await self._api_call(
+            role,
+            "message.card.patch",
+            self._client(role).im.v1.message.apatch(request),
+        )
 
     async def create_conversation_chat(
         self,
@@ -270,8 +275,11 @@ class FeishuGateway:
             .request_body(body)
             .build()
         )
-        response = await self._client("conversation").im.v1.chat.acreate(request)
-        self._require_success(response, "create chat")
+        response = await self._api_call(
+            "conversation",
+            "chat.create",
+            self._client("conversation").im.v1.chat.acreate(request),
+        )
         chat_id = getattr(response.data, "chat_id", None)
         if not chat_id:
             raise FeishuAPIError("Feishu chat creation succeeded without a chat_id")
@@ -291,8 +299,11 @@ class FeishuGateway:
             )
             .build()
         )
-        response = await self._client("conversation").im.v1.chat.aupdate(request)
-        self._require_success(response, "update chat description")
+        await self._api_call(
+            "conversation",
+            "chat.update",
+            self._client("conversation").im.v1.chat.aupdate(request),
+        )
 
     async def find_conversation_chat(
         self, thread_id: str, owner_open_id: str
@@ -303,8 +314,11 @@ class FeishuGateway:
             builder = ListChatRequest.builder().user_id_type("open_id").page_size(100)
             if page_token:
                 builder = builder.page_token(page_token)
-            response = await self._client("conversation").im.v1.chat.alist(builder.build())
-            self._require_success(response, "list chats for recovery")
+            response = await self._api_call(
+                "conversation",
+                "chat.list",
+                self._client("conversation").im.v1.chat.alist(builder.build()),
+            )
             for chat in response.data.items or []:
                 if (
                     marker in str(chat.description or "")
@@ -327,8 +341,11 @@ class FeishuGateway:
             .type("image" if attachment.kind == "image" else "file")
             .build()
         )
-        response = await self._client(role).im.v1.message_resource.aget(request)
-        self._require_success(response, "download message resource")
+        response = await self._api_call(
+            role,
+            "message.resource.download",
+            self._client(role).im.v1.message_resource.aget(request),
+        )
         if not response.file:
             raise FeishuAPIError("Feishu resource response did not contain a file")
         data = response.file.read(self.config.max_download_bytes + 1)
@@ -360,8 +377,11 @@ class FeishuGateway:
             )
             if page_token:
                 builder = builder.page_token(page_token)
-            response = await self._client(role).im.v1.message.alist(builder.build())
-            self._require_success(response, "list chat messages")
+            response = await self._api_call(
+                role,
+                "message.history.list",
+                self._client(role).im.v1.message.alist(builder.build()),
+            )
             for item in response.data.items or []:
                 try:
                     incoming = _normalize_history_message(
@@ -402,8 +422,9 @@ class FeishuGateway:
                 request = CreateImageRequest.builder().request_body(
                     CreateImageRequestBody.builder().image_type("message").image(handle).build()
                 ).build()
-                response = await client.im.v1.image.acreate(request)
-            self._require_success(response, "upload image")
+                response = await self._api_call(
+                    role, "image.upload", client.im.v1.image.acreate(request)
+                )
             return await self.send_message(
                 role,
                 chat_id,
@@ -420,8 +441,9 @@ class FeishuGateway:
                 .file(handle)
                 .build()
             ).build()
-            response = await client.im.v1.file.acreate(request)
-        self._require_success(response, "upload file")
+            response = await self._api_call(
+                role, "file.upload", client.im.v1.file.acreate(request)
+            )
         return await self.send_message(
             role,
             chat_id,
@@ -435,6 +457,20 @@ class FeishuGateway:
             return self._clients[role]
         except KeyError as error:
             raise FeishuAPIError(f"Feishu {role} app is not configured") from error
+
+    async def _api_call(self, role: AppRole, operation: str, awaitable: Any) -> Any:
+        with contextlib.suppress(Exception):
+            self.db.record_api_attempt(role, operation)
+        try:
+            response = await awaitable
+            self._require_success(response, operation)
+        except BaseException:
+            with contextlib.suppress(Exception):
+                self.db.record_api_result(role, operation, success=False)
+            raise
+        with contextlib.suppress(Exception):
+            self.db.record_api_result(role, operation, success=True)
+        return response
 
     @staticmethod
     def _require_success(response: Any, operation: str) -> None:

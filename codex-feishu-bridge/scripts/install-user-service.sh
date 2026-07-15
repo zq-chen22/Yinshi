@@ -48,6 +48,13 @@ sed "s&@PROJECT_ROOT@&${escaped_root}&g" \
   "${PROJECT_ROOT}/systemd/codex-feishu-bridge.service" \
   >"${USER_UNIT_DIR}/codex-feishu-bridge.service"
 chmod 0600 "${USER_UNIT_DIR}/codex-feishu-bridge.service"
+sed "s&@PROJECT_ROOT@&${escaped_root}&g" \
+  "${PROJECT_ROOT}/systemd/codex-feishu-daily-stats.service" \
+  >"${USER_UNIT_DIR}/codex-feishu-daily-stats.service"
+install -m 0600 \
+  "${PROJECT_ROOT}/systemd/codex-feishu-daily-stats.timer" \
+  "${USER_UNIT_DIR}/codex-feishu-daily-stats.timer"
+chmod 0600 "${USER_UNIT_DIR}/codex-feishu-daily-stats.service"
 systemctl --user daemon-reload
 
 echo
@@ -57,3 +64,4 @@ echo "2. 编辑 ${CONFIG_DIR}/config.toml，填写 Codex App ID。"
 echo "3. 只在本机编辑 ${CONFIG_DIR}/secrets.env，填写 Codex App Secret；不要发到聊天。"
 echo "4. 运行 ${VENV}/bin/codex-feishu-bridge --config ${CONFIG_DIR}/config.toml doctor"
 echo "5. 配对并 bootstrap 后执行：systemctl --user enable --now codex-feishu-bridge.service"
+echo "6. 配置 daily_stats 后执行：systemctl --user enable --now codex-feishu-daily-stats.timer"

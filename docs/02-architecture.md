@@ -41,6 +41,7 @@ SQLite 是本机事实来源，保存：
 - `inbox_messages`：飞书收件队列、租约、重试和状态待确认
 - `outbox_messages`：飞书发件队列、顺序、租约和重试
 - `turn_jobs`：飞书消息与 Codex turn 的关联
+- `api_call_usage`：按月、应用角色和操作类型聚合的飞书 REST 调用计数
 - `pending_approvals`：待处理的 Codex 审批
 - 附件暂存和运行配置历史
 
@@ -60,6 +61,8 @@ SQLite 是本机事实来源，保存：
 - 模糊提交边界保护
 - 历史消息补扫
 - App Server、WebSocket 子进程和发送队列监控
+- 自适应历史补扫和分阶段进度卡节流
+- 平滑排空、启动恢复和桥自有 turn 的外部回显抑制
 
 ### `CodexAppServer`
 
@@ -86,7 +89,7 @@ SQLite 是本机事实来源，保存：
 8. 获取 thread 租约，确认没有另一个活动 turn 或状态不明的外部写入。
 9. 在 `turn/start` 前把 inbox 标为 `dispatching`，建立不可自动重放的持久边界。
 10. Codex 接受 turn 后记录 `turn_jobs`。
-11. commentary、计划和工具事件持续更新进度卡片。
+11. commentary、计划和工具事件在新卡前 2 分钟最多每 5 秒、之后最多每 30 秒合并更新；终态立即更新。
 12. `turn/completed` 后把最终文字和交付物写入持久化 outbox。
 13. outbox worker 按顺序发送；成功后把 turn 标为 `delivered`。
 
@@ -95,6 +98,14 @@ SQLite 是本机事实来源，保存：
 网络可能恰好在桥发送 `turn/start` 后、收到返回前断开。此时桥无法证明 Codex 是否已经开始执行；盲目重试可能重复删除文件、发请求或修改系统。
 
 因此消息在 RPC 前先进入 `dispatching`。进程在这个边界中断后，启动恢复会把它标记为 `ambiguous`，要求所有者在私聊中明确选择重试或忽略。桥不会自动重放状态不明的副作用。
+
+这与已经取得 turn ID 后的基础设施中断不同。桥会把已确认的 turn 写入 `turn_jobs`；若启动时发现这个桥自有 turn 明确为 `interrupted`、没有最终答复，则在同一 thread 内创建恢复 turn。恢复输入不包含原用户原文，而是要求 Codex 检查对话和工作区现场、避免重复已经完成的副作用并继续收尾。旧 turn 先标记为已同步，新恢复 turn 仍关联同一飞书 message ID，因此不会被“本机外部更新”扫描器重复回显。
+
+## 停机和历史补扫
+
+收到 SIGTERM/SIGINT 后，服务进入 drain：不再领取 inbox 新任务，但继续处理已经排队或活动的 turn、终态卡、持久 outbox 和附件。全部排空后才关闭 App Server；systemd 为此提供比桥内 6 小时排空上限略长的停止窗口。
+
+WebSocket 是实时消息主路径。REST 历史补扫以每个会话最后活动时间单独调度：活跃会话约 10 分钟，较冷会话约 30、60、120 分钟，并带稳定错峰。启动和 WebSocket 子进程重启会强制补扫；持久 message ID 去重使重叠时间窗保持幂等。
 
 ## 同一 thread 的并发边界
 

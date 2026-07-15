@@ -128,7 +128,6 @@ def test_binding_lifecycle_and_persistence(tmp_path):
     try:
         binding = db.upsert_thread(thread())
         assert binding.title == "第一行预览"
-        assert binding.thread_created_at == 10
         assert binding.chat_id is None
         assert binding.sync_state == "pending"
         assert db.list_bindings(pending_only=True) == [binding]
@@ -136,15 +135,6 @@ def test_binding_lifecycle_and_persistence(tmp_path):
         # 首次登记的标题保持稳定，避免 preview/name 变化造成重复群或串路由。
         db.upsert_thread(thread(name="正式标题", updated_at=30))
         assert db.get_binding_by_thread("thread-1").title == "第一行预览"
-
-        refreshed = thread(name="再次改名", updated_at=35)
-        refreshed.cwd = "/home/test/new-work"
-        refreshed.created_at = 11
-        db.refresh_thread_metadata(refreshed)
-        metadata = db.get_binding_by_thread("thread-1")
-        assert metadata is not None
-        assert metadata.cwd == "/home/test/new-work"
-        assert metadata.thread_created_at == 11
 
         # 建群后保留飞书侧已采用的标题，避免每次轮询重命名。
         db.bind_chat("thread-1", "oc_chat", title="固定群名")
@@ -363,6 +353,27 @@ def test_turn_job_survives_restart_until_delivery(tmp_path):
         assert reopened.list_recoverable_turn_jobs() == []
     finally:
         reopened.close()
+
+
+def test_api_usage_is_aggregated_by_month_and_operation(tmp_path):
+    db = BridgeDB(tmp_path / "bridge.sqlite")
+    try:
+        db.record_api_attempt("conversation", "message.history.list")
+        db.record_api_result(
+            "conversation", "message.history.list", success=True
+        )
+        db.record_api_attempt("conversation", "message.history.list")
+        db.record_api_result(
+            "conversation", "message.history.list", success=False
+        )
+        db.record_api_attempt("conversation", "message.card.patch")
+
+        assert db.api_usage() == {
+            "message.card.patch": 1,
+            "message.history.list": 2,
+        }
+    finally:
+        db.close()
 
 
 def test_artifact_requires_chat_scoped_second_approval(tmp_path):

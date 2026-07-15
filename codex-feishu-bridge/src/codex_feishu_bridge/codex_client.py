@@ -15,9 +15,10 @@ from .models import ThreadSummary
 
 LOG = logging.getLogger(__name__)
 # A single image-generation completion notification can legitimately contain
-# several megabytes of inline image data. The bridge no longer requests full
-# image history, but it still has to accept the live JSONL notification. Keep
-# enough headroom for multi-image turns so asyncio's line reader stays intact.
+# several megabytes of inline image data.  The bridge no longer requests full
+# image history, but it still has to accept the live JSONL notification.  Keep
+# enough headroom for multi-image turns so asyncio's line reader does not tear
+# down an otherwise healthy app-server connection.
 DEFAULT_STREAM_LIMIT_BYTES = 128 * 1024 * 1024
 Message = dict[str, Any]
 NotificationHandler = Callable[[Message], Awaitable[None]]
