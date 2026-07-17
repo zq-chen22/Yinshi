@@ -50,9 +50,15 @@
 > **使用 Codex-5.6 或更高水平的 AI Agent 模型，拉取当前项目并遵循指令即可。**
 
 <p align="center">
-  <img src="showcase/assets/feishu-bridge-demo.png" width="40%" alt="飞书桥多设备会话列表">
-  &nbsp;
-  <img src="showcase/assets/feishu-card-demo.png" width="40%" alt="飞书桥卡片与文件交付">
+  <img src="showcase/assets/feature-multi-device.png" width="100%" alt="同时在多个设备上进行对话">
+</p>
+
+<p align="center">
+  <img src="showcase/assets/feature-file-upload.png" width="100%" alt="上传资料和文件">
+</p>
+
+<p align="center">
+  <img src="showcase/assets/feature-image-download.png" width="100%" alt="处理并下载图片">
 </p>
 
 <div align="center">
