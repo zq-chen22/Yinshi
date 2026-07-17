@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import contextlib
 import json
 import logging
@@ -69,6 +70,7 @@ class CodexAppServer:
         self._write_lock = asyncio.Lock()
         self._closed = asyncio.Event()
         self._resumed_threads: set[str] = set()
+        self._thread_config_overrides: dict[str, Any] = {}
         self.initialize_result: Message = {}
         self.cli_version: str | None = None
 
@@ -84,6 +86,16 @@ class CodexAppServer:
 
     def set_server_request_handler(self, handler: ServerRequestHandler) -> None:
         self._server_request_handler = handler
+
+    def configure_thread_defaults(
+        self, *, config_overrides: dict[str, Any] | None = None
+    ) -> None:
+        """Apply bridge-owned config to every subsequent start and resume."""
+
+        self._thread_config_overrides = copy.deepcopy(config_overrides or {})
+        # Existing app-server subscriptions retain the config they were
+        # resumed with. Force the next turn to resume again after a change.
+        self._resumed_threads.clear()
 
     async def start(self) -> None:
         if self.process and self.process.returncode is None:
@@ -314,6 +326,8 @@ class CodexAppServer:
             params["serviceTier"] = service_tier
         if cwd:
             params["cwd"] = cwd
+        if self._thread_config_overrides:
+            params["config"] = copy.deepcopy(self._thread_config_overrides)
         result = await self.request("thread/resume", params)
         self._resumed_threads.add(thread_id)
         return result
@@ -359,6 +373,8 @@ class CodexAppServer:
             params["model"] = model
         if service_tier:
             params["serviceTier"] = service_tier
+        if self._thread_config_overrides:
+            params["config"] = copy.deepcopy(self._thread_config_overrides)
         result = await self.request("thread/start", params)
         thread = result.get("thread", {})
         if thread.get("id"):
@@ -370,15 +386,6 @@ class CodexAppServer:
 
     async def archive_thread(self, thread_id: str) -> None:
         await self.request("thread/archive", {"threadId": thread_id})
-
-    async def compact_thread(self, thread_id: str) -> None:
-        """Start native history compaction.
-
-        The RPC acknowledges immediately. Callers must keep the thread
-        exclusively leased until the matching compaction turn completes.
-        """
-
-        await self.request("thread/compact/start", {"threadId": thread_id})
 
     async def unsubscribe_thread(self, thread_id: str) -> None:
         await self.request("thread/unsubscribe", {"threadId": thread_id})

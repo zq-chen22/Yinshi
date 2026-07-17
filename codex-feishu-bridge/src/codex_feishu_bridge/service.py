@@ -34,6 +34,7 @@ from .models import (
     ThreadSummary,
     TurnJob,
 )
+from .visual_proxy import build_codex_hook_config
 
 
 LOG = logging.getLogger(__name__)
@@ -85,6 +86,15 @@ class BridgeService:
         self.codex = codex
         self.gateway = gateway
         self.artifacts = ArtifactBroker(config, gateway)
+        configure_threads = getattr(self.codex, "configure_thread_defaults", None)
+        if callable(configure_threads):
+            configure_threads(
+                config_overrides=build_codex_hook_config(
+                    config.visual_proxy_dir,
+                    max_edge=config.image_proxy_max_edge,
+                    quality=config.image_proxy_jpeg_quality,
+                )
+            )
         self.worker_id = f"{uuid.uuid4()}"
         self._stop = asyncio.Event()
         self._draining = False
@@ -105,9 +115,6 @@ class BridgeService:
         self._finalizing: set[str] = set()
         self._progress_locks: dict[str, asyncio.Lock] = {}
         self._terminal_progress_messages: set[str] = set()
-        self._compacting_threads: set[str] = set()
-        self._compaction_waiters: dict[str, asyncio.Future[dict[str, Any]]] = {}
-        self._compaction_turns: dict[str, str] = {}
         self._auditing_turns: set[str] = set()
         self._active_audit_next: dict[str, float] = {}
         self._warned: set[str] = set()
@@ -553,20 +560,8 @@ class BridgeService:
                         and turn.get("status") == "interrupted"
                         and not final_messages
                     ):
-                        if not self._compaction_threshold_reached(job.thread_id):
-                            await self._continue_interrupted_turn(job)
-                            continue
-                        # Replaying a recovery instruction into an already
-                        # oversized thread can turn a missed completion into a
-                        # second image-heavy hang. Finalize the proven terminal
-                        # turn instead; the next user message will compact
-                        # before starting.
-                        latest = commentary_messages[-1] if commentary_messages else ""
-                        active.final_text = (
-                            "Codex 已中断。检测到该对话历史已达到压缩阈值，"
-                            "为避免在超大上下文中自动续做，本次没有启动恢复 turn。"
-                            + (f"\n\n中断前最后可见进展：\n{latest}" if latest else "")
-                        )
+                        await self._continue_interrupted_turn(job)
+                        continue
                     if known_active is None:
                         self._register_active(active)
                     await self._finalize_turn(active, turn)
@@ -1143,37 +1138,6 @@ class BridgeService:
             )
             self.db.complete_incoming(message.message_id)
             return
-        if text in {"!compact", "/compact"}:
-            queue = self._thread_queues.get(binding.thread_id)
-            if (
-                binding.thread_id in self._active_by_thread
-                or binding.thread_id in self._compacting_threads
-                or (queue is not None and not queue.empty())
-            ):
-                await self.gateway.send_text(
-                    "conversation",
-                    message.chat_id,
-                    "当前线程仍在执行或排队；为避免原生压缩替换活动 turn，"
-                    "本次没有压缩。请等待任务完成后重试 `/compact`。",
-                    idempotency_key=f"compact-busy:{message.message_id}",
-                )
-                self.db.complete_incoming(message.message_id)
-                return
-            progress_id = await self.gateway.send_card(
-                "conversation",
-                message.chat_id,
-                progress_card(
-                    "Codex 正在压缩上下文",
-                    "使用原生 `thread/compact/start` 保留关键上下文并清理旧工具/图片链。",
-                ),
-                idempotency_key=f"compact:{message.message_id}",
-            )
-            self.db.complete_incoming(message.message_id)
-            self._background_task(
-                self._manual_compaction(binding, progress_id),
-                f"manual-compact:{binding.thread_id}",
-            )
-            return
         if text.startswith("!steer "):
             message.text = text[7:].strip()
             active = self._active_by_thread.get(binding.thread_id)
@@ -1236,7 +1200,6 @@ class BridgeService:
                 "• `/permissions`：选择权限预设\n"
                 "• `/status`：查看当前会话配置\n"
                 "• `/compat`：检测并修复 CLI 设置兼容门禁\n"
-                "• `/compact`：在会话空闲时原生压缩长上下文\n"
                 "飞书会用按钮代替终端里的选择弹窗。"
             )
         elif kind in {"配置", "设置", "状态"}:
@@ -1773,270 +1736,6 @@ class BridgeService:
             idempotency_key=f"steered:{message.message_id}",
         )
 
-    async def _manual_compaction(
-        self, binding: Binding, progress_message_id: str
-    ) -> None:
-        thread_id = binding.thread_id
-        lease_ttl = max(300, int(self.config.compaction_timeout_seconds) + 300)
-        if not self.db.acquire_thread_lease(
-            thread_id, self.worker_id, ttl_seconds=lease_ttl
-        ):
-            await self.gateway.patch_card(
-                "conversation",
-                progress_message_id,
-                progress_card(
-                    "Codex 未压缩",
-                    "线程安全租约正被其他任务持有，请稍后重试 `/compact`。",
-                    color="orange",
-                ),
-            )
-            return
-        try:
-            runtime = self._runtime_settings(thread_id)
-            await self._compact_thread(thread_id, runtime)
-            await self.gateway.patch_card(
-                "conversation",
-                progress_message_id,
-                progress_card(
-                    "Codex 上下文已压缩",
-                    "线程 ID 与飞书群绑定保持不变；旧工具调用和截图链已由原生压缩摘要替换。",
-                    color="green",
-                ),
-            )
-        except Exception as error:
-            LOG.exception("Manual compaction failed for %s", thread_id)
-            with contextlib.suppress(Exception):
-                await self.gateway.patch_card(
-                    "conversation",
-                    progress_message_id,
-                    progress_card(
-                        "Codex 压缩失败",
-                        f"未启动新的用户 turn；原历史仍保留。错误：{type(error).__name__}",
-                        color="red",
-                    ),
-                )
-        finally:
-            self.db.release_thread_lease(thread_id, self.worker_id)
-
-    def _compaction_state(self, thread_id: str) -> dict[str, Any] | None:
-        raw = self.db.get_setting(f"compaction_inflight:{thread_id}", "") or ""
-        if not raw:
-            return None
-        try:
-            value = json.loads(raw)
-        except json.JSONDecodeError:
-            return {"status": "unknown", "raw": raw}
-        return value if isinstance(value, dict) else {"status": "unknown"}
-
-    def _save_compaction_state(
-        self, thread_id: str, state: dict[str, Any]
-    ) -> None:
-        state["updated_at"] = int(time.time())
-        self.db.set_setting(
-            f"compaction_inflight:{thread_id}",
-            json.dumps(state, ensure_ascii=False, separators=(",", ":")),
-        )
-
-    def _clear_compaction_state(self, thread_id: str) -> None:
-        self.db.delete_setting(f"compaction_inflight:{thread_id}")
-
-    def _mark_compaction_success(self, thread_id: str) -> None:
-        """Reset usage and visual-history hints after proven native compaction."""
-
-        self.db.set_setting(f"token_usage:{thread_id}:input", "0")
-        self.db.set_setting(
-            f"token_usage:{thread_id}:compacted_at", str(int(time.time()))
-        )
-        self.db.delete_setting(f"token_usage:{thread_id}:compact_retry_after")
-        self.db.delete_setting(f"token_usage:{thread_id}:visual_history")
-
-    async def _settle_prior_compaction(self, thread_id: str) -> None:
-        """Resolve a compact RPC whose acknowledgement/terminal event was lost.
-
-        Once ``thread/compact/start`` has been sent, starting a normal turn is
-        unsafe until disk state proves the compaction turn is terminal. The
-        marker survives bridge/app-server restarts and is intentionally more
-        conservative than an in-memory timeout.
-        """
-
-        state = self._compaction_state(thread_id)
-        if state is None:
-            return
-        raw = await self.codex.read_thread(thread_id, include_turns=False)
-        turns = await self._turn_summaries(
-            thread_id, items_view="summary", max_turns=20
-        )
-        status_type = str((raw.get("status") or {}).get("type") or "")
-        if status_type == "active" or any(
-            str(turn.get("status") or "") == "inProgress" for turn in turns[:1]
-        ):
-            raise RuntimeError("a previously requested context compaction is still active")
-
-        expected = str(state.get("turn_id") or "")
-        candidate = next(
-            (
-                turn
-                for turn in turns
-                if not expected or str(turn.get("id") or "") == expected
-            ),
-            None,
-        )
-        if candidate and str(candidate.get("status") or "") == "completed":
-            context_seen = bool(state.get("context_seen")) or any(
-                str(item.get("type") or "") == "contextCompaction"
-                for item in candidate.get("items") or []
-            )
-            if context_seen:
-                self._mark_compaction_success(thread_id)
-        # Idle disk state proves that no compact turn can still replace a new
-        # user turn. A failed/unknown terminal compact may be retried normally.
-        self._clear_compaction_state(thread_id)
-        self._compaction_turns.pop(thread_id, None)
-
-    async def _compact_thread(
-        self, thread_id: str, runtime: RuntimeSettings
-    ) -> dict[str, Any]:
-        if thread_id in self._active_by_thread:
-            raise RuntimeError("refusing to compact an active Codex turn")
-        if thread_id in self._compacting_threads:
-            raise RuntimeError("thread compaction is already running")
-        await self._settle_prior_compaction(thread_id)
-        # Native compaction replaces any task that is already active on the
-        # thread.  A task may have been started from the local CLI rather than
-        # through this bridge, so the in-memory active map is not sufficient.
-        # Use the bounded/image-free APIs for a final preflight before sending
-        # the destructive-to-an-active-turn compact RPC.
-        raw = await self.codex.read_thread(thread_id, include_turns=False)
-        latest = await self._turn_summaries(
-            thread_id, items_view="notLoaded", max_turns=1
-        )
-        status_type = str((raw.get("status") or {}).get("type") or "")
-        latest_status = str((latest[0].get("status") if latest else "") or "")
-        if status_type == "active" or latest_status == "inProgress":
-            raise RuntimeError("refusing to replace an externally active Codex turn")
-        self._compacting_threads.add(thread_id)
-        try:
-            resumed = await self.codex.resume_thread(
-                thread_id,
-                approval_policy=runtime.approval_policy,
-                sandbox=runtime.sandbox,
-                model=runtime.model,
-                service_tier=runtime.service_tier,
-                exclude_turns=True,
-            )
-            resumed_thread = resumed.get("thread") or resumed
-            resumed_status = str(
-                ((resumed_thread.get("status") or {}).get("type") or "")
-                if isinstance(resumed_thread, dict)
-                else ""
-            )
-            if resumed_status == "active":
-                raise RuntimeError("refusing to replace an externally active Codex turn")
-
-            # Install the waiter immediately before the RPC. The app-server may
-            # emit lifecycle events before acknowledging the request, so doing
-            # this after compact_thread() would lose fast completions.
-            loop = asyncio.get_running_loop()
-            waiter: asyncio.Future[dict[str, Any]] = loop.create_future()
-            self._compaction_waiters[thread_id] = waiter
-            self._compaction_turns.pop(thread_id, None)
-            self._save_compaction_state(
-                thread_id,
-                {"status": "requested", "requested_at": int(time.time())},
-            )
-            await self.codex.compact_thread(thread_id)
-            turn = await asyncio.wait_for(
-                asyncio.shield(waiter), timeout=self.config.compaction_timeout_seconds
-            )
-            status = str(turn.get("status") or "completed")
-            if status != "completed":
-                error = turn.get("error") or {}
-                raise RuntimeError(
-                    f"compaction turn ended as {status}: {error.get('message', error)}"
-                )
-            # A fresh token-usage notification normally follows compaction. Set
-            # a conservative zero meanwhile so the next queued message does not
-            # immediately launch another compaction from stale usage data.
-            self._mark_compaction_success(thread_id)
-            self._clear_compaction_state(thread_id)
-            return turn
-        finally:
-            current = self._compaction_waiters.pop(thread_id, None)
-            if current and not current.done():
-                current.cancel()
-            if self._compaction_state(thread_id) is None:
-                self._compaction_turns.pop(thread_id, None)
-            self._compacting_threads.discard(thread_id)
-
-    def _compaction_threshold_reached(self, thread_id: str) -> bool:
-        input_tokens = int(
-            self.db.get_setting(f"token_usage:{thread_id}:input", "0") or 0
-        )
-        context_window = int(
-            self.db.get_setting(f"token_usage:{thread_id}:window", "0") or 0
-        )
-        ratio_reached = bool(
-            context_window > 0
-            and input_tokens / context_window >= self.config.auto_compact_ratio
-        )
-        absolute_reached = (
-            input_tokens >= self.config.auto_compact_min_input_tokens
-        )
-        visual_history = self.db.get_setting(
-            f"token_usage:{thread_id}:visual_history", "0"
-        ) == "1"
-        visual_reached = bool(
-            visual_history
-            and input_tokens >= self.config.auto_compact_visual_input_tokens
-        )
-        return ratio_reached or absolute_reached or visual_reached
-
-    def _should_auto_compact(self, thread_id: str) -> bool:
-        retry_after = int(
-            self.db.get_setting(
-                f"token_usage:{thread_id}:compact_retry_after", "0"
-            )
-            or 0
-        )
-        return retry_after <= int(time.time()) and self._compaction_threshold_reached(
-            thread_id
-        )
-
-    async def _maybe_auto_compact(
-        self,
-        thread_id: str,
-        runtime: RuntimeSettings,
-        job: ScheduledMessage,
-    ) -> None:
-        await self._settle_prior_compaction(thread_id)
-        if not self._should_auto_compact(thread_id):
-            return
-        with contextlib.suppress(Exception):
-            await self.gateway.patch_card(
-                job.app_role,
-                job.progress_message_id,
-                progress_card(
-                    "Codex 正在整理长上下文",
-                    "检测到历史接近配置阈值，先执行原生压缩；完成后会自动继续本条消息。",
-                ),
-            )
-        try:
-            await self._compact_thread(thread_id, runtime)
-        except Exception:
-            LOG.exception("Automatic compaction did not reach a proven terminal state for %s", thread_id)
-            with contextlib.suppress(Exception):
-                await self.gateway.patch_card(
-                    job.app_role,
-                    job.progress_message_id,
-                    progress_card(
-                        "Codex 压缩未完成",
-                        "尚不能证明压缩 turn 已终止；本条用户任务会安全保留并重试，"
-                        "不会与压缩并发启动。",
-                        color="orange",
-                    ),
-                )
-            raise
-
     async def _queue_thread_message(self, item: InboxItem, binding: Binding) -> None:
         queue = self._thread_queues.setdefault(binding.thread_id, asyncio.Queue())
         position = queue.qsize() + (1 if binding.thread_id in self._active_by_thread else 0)
@@ -2090,7 +1789,7 @@ class BridgeService:
         while active := self._active_by_thread.get(thread_id):
             await self._turn_done.setdefault(active.turn_id, asyncio.Event()).wait()
         await self._wait_thread_available(thread_id, job)
-        lease_ttl = max(300, int(self.config.compaction_timeout_seconds) + 300)
+        lease_ttl = 300
         if not self.db.acquire_thread_lease(
             thread_id, self.worker_id, ttl_seconds=lease_ttl
         ):
@@ -2098,23 +1797,6 @@ class BridgeService:
             return
         try:
             runtime = self._runtime_settings(thread_id)
-            has_image_input = any(
-                attachment.kind == "image" for attachment in message.attachments
-            )
-            if has_image_input:
-                # A Feishu image is injected as localImage before Codex emits
-                # any imageView item. Mark it early so an already-large thread
-                # compacts before accepting another visual payload.
-                self.db.set_setting(
-                    f"token_usage:{thread_id}:visual_history", "1"
-                )
-            await self._maybe_auto_compact(thread_id, runtime, job)
-            if has_image_input:
-                # Native compaction clears the previous-history hint. Restore
-                # it for the localImage that this new turn is about to persist.
-                self.db.set_setting(
-                    f"token_usage:{thread_id}:visual_history", "1"
-                )
             inputs = await self.artifacts.prepare_inputs(message)
             self.db.mark_incoming_dispatching(message.message_id)
             self._pending_jobs[thread_id] = job
@@ -2229,16 +1911,6 @@ class BridgeService:
             busy = status_type == "active" or latest_status == "inProgress"
             if busy:
                 external_turn = str(latest.get("id") or "external-active")
-                if self._compaction_state(thread_id) is not None:
-                    notice = (
-                        "上一次上下文压缩仍在 Codex 中运行；"
-                        "消息已保留，并且不会并发启动用户 turn。"
-                    )
-                    if notice != last_notice:
-                        await self._patch_job_waiting(job, notice)
-                        last_notice = notice
-                    await asyncio.sleep(5)
-                    continue
                 if age is None or age > 300:
                     self.db.set_setting(f"blocked_thread:{thread_id}", external_turn)
                     warning = (
@@ -2295,7 +1967,6 @@ class BridgeService:
                 "• `解除线程 threadID`：本机核对进程中断的 turn 后解除安全锁\n"
                 "• `/model` / `/fast` / `/permissions` / `/status`：按 Codex CLI 方式管理临时任务配置\n"
                 "• `/compat`：检测并修复 CLI 升级后的设置兼容门禁\n"
-                "• 群聊 `/compact`：在对应会话空闲时压缩长上下文\n"
                 "其他文字会在一个临时、上下文无关的 Codex 对话中处理。"
             )
             await self._admin_reply(message, reply, "help")
@@ -2701,87 +2372,11 @@ class BridgeService:
             window = int(usage.get("modelContextWindow") or 0)
             if window:
                 self.db.set_setting(f"token_usage:{thread_id}:window", str(window))
-            if input_tokens == 0:
-                self.db.delete_setting(f"token_usage:{thread_id}:visual_history")
             active_usage = self._active_by_thread.get(thread_id)
             if active_usage:
                 active_usage.last_event_monotonic = time.monotonic()
                 active_usage.last_event_name = "token usage"
             return
-        if method == "item/completed" and thread_id:
-            completed_item = params.get("item") or {}
-            if completed_item.get("type") in {"imageGeneration", "imageView"}:
-                # Codex persists these visual blocks in the rollout. Remember
-                # that the thread is image-heavy even after bridge-side
-                # notification slimming removes the inline payload.
-                self.db.set_setting(
-                    f"token_usage:{thread_id}:visual_history", "1"
-                )
-        compaction_waiter = self._compaction_waiters.get(thread_id)
-        compaction_state = self._compaction_state(thread_id) if thread_id else None
-        if compaction_waiter is not None or compaction_state is not None:
-            compaction_state = dict(compaction_state or {})
-            if method == "turn/started":
-                expected = str(compaction_state.get("turn_id") or "")
-                if turn_id and (not expected or expected == turn_id):
-                    self._compaction_turns[thread_id] = turn_id
-                    compaction_state.update(
-                        {"status": "running", "turn_id": turn_id}
-                    )
-                    self._save_compaction_state(thread_id, compaction_state)
-                    return
-            if method in {"item/started", "item/completed"}:
-                item = params.get("item") or {}
-                if item.get("type") == "contextCompaction":
-                    if turn_id:
-                        expected = str(
-                            compaction_state.get("turn_id")
-                            or self._compaction_turns.get(thread_id)
-                            or ""
-                        )
-                        if expected and expected != turn_id:
-                            LOG.warning(
-                                "Ignoring context compaction item for unexpected turn %s "
-                                "while waiting for %s",
-                                turn_id,
-                                expected,
-                            )
-                        else:
-                            self._compaction_turns[thread_id] = turn_id
-                            compaction_state.update(
-                                {
-                                    "status": "running",
-                                    "turn_id": turn_id,
-                                    "context_seen": True,
-                                }
-                            )
-                            self._save_compaction_state(thread_id, compaction_state)
-                    return
-            if method == "turn/completed":
-                expected = str(
-                    compaction_state.get("turn_id")
-                    or self._compaction_turns.get(thread_id)
-                    or ""
-                )
-                if expected and turn_id == expected:
-                    status = str(turn_raw.get("status") or "completed")
-                    if not compaction_state.get("context_seen"):
-                        # A local/external turn can win the narrow race between
-                        # preflight and compact/start. Its completion is not
-                        # proof that history was compacted; keep the durable
-                        # marker and waiter unresolved until a real
-                        # contextCompaction item is observed or disk recovery
-                        # proves the request terminal.
-                        compaction_state["status"] = "terminal_without_context"
-                        self._save_compaction_state(thread_id, compaction_state)
-                    else:
-                        if status == "completed":
-                            self._mark_compaction_success(thread_id)
-                        self._clear_compaction_state(thread_id)
-                        self._compaction_turns.pop(thread_id, None)
-                        if compaction_waiter is not None and not compaction_waiter.done():
-                            compaction_waiter.set_result(turn_raw)
-                        return
         active = self._active_by_turn.get(turn_id) if turn_id else None
         if method == "turn/started":
             if not active:

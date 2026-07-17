@@ -25,6 +25,8 @@
 <p><strong>03 / 文件流转</strong><br>
 &emsp;支持上传文件、图片和视频；任务完成后，Codex 会发来必要的图片、文件和视频</p>
 
+> 飞书图片和 `view_image` 会在读取前强制改写为最长边 1024px 的物理 JPEG 代理；代理失败时拒绝读取，不回退到原图。桥不提前压缩 Codex 上下文。
+
 <p><strong>04 / 无需梯子</strong><br>
 &emsp;没有梯子，也能流畅使用 Codex</p>
 

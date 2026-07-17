@@ -113,11 +113,10 @@ for raw in sys.stdin:
         send({"id": request_id, "result": {
             "thread": {"id": params["threadId"]}, "received": params
         }})
-    elif method == "thread/compact/start":
-        if set(params) != {"threadId"}:
-            send({"id": request_id, "error": {"message": "unexpected compact params"}})
-        else:
-            send({"id": request_id, "result": {}})
+    elif method == "thread/start":
+        send({"id": request_id, "result": {
+            "thread": {"id": "thread-new", "received": params}
+        }})
     elif method == "thread/settings/update":
         send({"id": request_id, "result": {"applied": params}})
     elif method == "model/list":
@@ -215,12 +214,22 @@ async def test_jsonl_client_filters_threads_and_dispatches_events(tmp_path):
             "sortDirection": "desc",
         }
 
+        hook_config = {
+            "bypass_hook_trust": True,
+            "hooks.PreToolUse": [{"matcher": "view_image", "hooks": []}],
+        }
+        client.configure_thread_defaults(config_overrides=hook_config)
         resumed = await client.resume_thread(
             "thread-1", cwd="/work/migrated", exclude_turns=True
         )
         assert resumed["received"]["cwd"] == "/work/migrated"
-        await client.compact_thread("thread-1")
-
+        assert resumed["received"]["config"] == hook_config
+        started = await client.start_thread(
+            cwd="/work/new",
+            approval_policy="never",
+            sandbox="danger-full-access",
+        )
+        assert started["received"]["config"] == hook_config
         turn = await client.start_turn(
             "thread-1",
             [{"type": "text", "text": "继续"}],

@@ -35,12 +35,11 @@ progress_stale_seconds = 120.0
 # systemd 更新时先停止接新单，最多等待 6 小时让已接单任务和最终结果排空。
 shutdown_drain_timeout_seconds = 21600.0
 
-# 任一条件成立时，在下一轮前原生压缩：上下文达到 65%、输入达到 10 万 token，
-# 或曾查看/生成图片且输入达到 6 万 token。图片本体会进入 Codex 历史，因此更早压缩。
-auto_compact_ratio = 0.65
-auto_compact_min_input_tokens = 100000
-auto_compact_visual_input_tokens = 60000
-compaction_timeout_seconds = 1800.0
+# 飞书图片和 view_image 都只向 Codex 提供物理重编码的 JPEG 代理。
+# 代理失败时禁止回退读取原图。桥不主动触发上下文压缩。
+image_proxy_max_edge = 1024
+image_proxy_jpeg_quality = 75
+
 group_suffix = "-你的机器名称"
 
 # 默认运行配置；键名与 Codex config.toml 对应。每个飞书对话仍可单独覆盖。

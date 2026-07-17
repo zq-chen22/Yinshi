@@ -72,10 +72,8 @@ class BridgeConfig:
     progress_heartbeat_seconds: float = 30.0
     progress_stale_seconds: float = 120.0
     shutdown_drain_timeout_seconds: float = 6 * 3600.0
-    auto_compact_ratio: float = 0.65
-    auto_compact_min_input_tokens: int = 100_000
-    auto_compact_visual_input_tokens: int = 60_000
-    compaction_timeout_seconds: float = 1800.0
+    image_proxy_max_edge: int = 1024
+    image_proxy_jpeg_quality: int = 75
     group_suffix: str = "-鼎盛笔记本ubuntu"
     auto_discover_new_threads: bool = True
     source_kinds: list[str] = field(
@@ -92,6 +90,10 @@ class BridgeConfig:
     feishu: FeishuConfig = field(default_factory=FeishuConfig)
     daily_stats: DailyStatsConfig = field(default_factory=DailyStatsConfig)
 
+    @property
+    def visual_proxy_dir(self) -> Path:
+        return self.state_dir / "visual-proxies"
+
     def prepare_dirs(self) -> None:
         for path in (
             self.state_dir,
@@ -99,6 +101,7 @@ class BridgeConfig:
             self.outbox_dir,
             self.admin_scratch_dir,
             self.managed_workspaces_dir,
+            self.visual_proxy_dir,
         ):
             path.mkdir(parents=True, exist_ok=True, mode=0o700)
             path.chmod(0o700)
@@ -170,15 +173,9 @@ def load_config(path: str | Path | None = None) -> BridgeConfig:
         shutdown_drain_timeout_seconds=float(
             bridge.get("shutdown_drain_timeout_seconds", 6 * 3600.0)
         ),
-        auto_compact_ratio=float(bridge.get("auto_compact_ratio", 0.65)),
-        auto_compact_min_input_tokens=int(
-            bridge.get("auto_compact_min_input_tokens", 100_000)
-        ),
-        auto_compact_visual_input_tokens=int(
-            bridge.get("auto_compact_visual_input_tokens", 60_000)
-        ),
-        compaction_timeout_seconds=float(
-            bridge.get("compaction_timeout_seconds", 1800.0)
+        image_proxy_max_edge=int(bridge.get("image_proxy_max_edge", 1024)),
+        image_proxy_jpeg_quality=int(
+            bridge.get("image_proxy_jpeg_quality", 75)
         ),
         group_suffix=str(bridge.get("group_suffix", "-鼎盛笔记本ubuntu")),
         auto_discover_new_threads=bool(bridge.get("auto_discover_new_threads", True)),

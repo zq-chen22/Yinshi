@@ -6,11 +6,13 @@ import os
 import re
 import secrets
 from pathlib import Path
+from typing import Protocol
 from urllib.parse import unquote, urlparse
 
 from .config import BridgeConfig
 from .feishu import FeishuGateway
 from .models import Attachment, IncomingMessage
+from .visual_proxy import VisualProxyStore
 
 
 SENSITIVE_PARTS = {
@@ -41,10 +43,24 @@ class ArtifactError(RuntimeError):
     pass
 
 
+class VisualProxyFactory(Protocol):
+    def create(self, source: Path) -> Path: ...
+
+
 class ArtifactBroker:
-    def __init__(self, config: BridgeConfig, gateway: FeishuGateway):
+    def __init__(
+        self,
+        config: BridgeConfig,
+        gateway: FeishuGateway,
+        visual_proxy_store: VisualProxyFactory | None = None,
+    ):
         self.config = config
         self.gateway = gateway
+        self.visual_proxy_store = visual_proxy_store or VisualProxyStore(
+            config.visual_proxy_dir,
+            max_edge=config.image_proxy_max_edge,
+            quality=config.image_proxy_jpeg_quality,
+        )
 
     async def prepare_inputs(self, message: IncomingMessage) -> list[dict]:
         inputs: list[dict] = []
@@ -59,7 +75,19 @@ class ArtifactBroker:
                 raise ArtifactError("attachment was not staged")
             local = self._validate_staged(attachment.local_path)
             if attachment.kind == "image":
-                inputs.append({"type": "localImage", "path": str(local)})
+                try:
+                    proxy = self.visual_proxy_store.create(local)
+                    proxy = self._validate_visual_proxy(proxy, source=local)
+                except ArtifactError:
+                    raise
+                except Exception as error:
+                    # Never degrade to the original image: a proxy failure is a
+                    # failed input preparation, not permission to expose the
+                    # full-resolution upload to Codex.
+                    raise ArtifactError(
+                        "could not create the safe image proxy"
+                    ) from error
+                inputs.append({"type": "localImage", "path": str(proxy)})
             else:
                 descriptions.append(
                     f"用户通过飞书发送了{attachment.kind}附件，已隔离保存到：{local}。"
@@ -93,6 +121,24 @@ class ArtifactBroker:
             }
         )
         return inputs
+
+    @staticmethod
+    def _validate_visual_proxy(candidate: Path, *, source: Path) -> Path:
+        candidate = Path(candidate)
+        if candidate.is_symlink():
+            raise ArtifactError("image proxies cannot be symlinks")
+        try:
+            path = candidate.resolve(strict=True)
+        except OSError as error:
+            raise ArtifactError("image proxy was not created") from error
+        if not path.is_file() or path.stat().st_size <= 0:
+            raise ArtifactError("image proxy is not a non-empty regular file")
+        try:
+            if os.path.samefile(path, source):
+                raise ArtifactError("image proxy must be physically distinct from source")
+        except OSError as error:
+            raise ArtifactError("image proxy identity could not be verified") from error
+        return path
 
     async def stage_attachments(self, message: IncomingMessage) -> list[Path]:
         staged: list[Path] = []
