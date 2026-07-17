@@ -8,10 +8,6 @@
 
 </div>
 
-<p align="center">
-  <img src="showcase/assets/feishu-bridge-demo.png" width="420" alt="飞书桥实际使用效果">
-</p>
-
 ## 我们的宗旨
 
 越接近通用的 AI，越应该用最自然的方式协作。
@@ -26,15 +22,21 @@
 
 > 从本机 Codex 窗口产生的对话，只同步用户提问与完整结束后的最终回复；思考、工具调用和中间进度不会同步。
 
-## 使用
-
-> **使用 Codex-5.6 或更高水平的 AI Agent 模型，拉取当前项目并遵循指令即可。**
-
 ## 我们的承诺
 
 | 放心使用 | 真实稳定 | 无限 DIY |
 | :---: | :---: | :---: |
 | 不植入病毒，不加入恶意指令 | 已经历超过 300 万次真实对话，保持稳定 | 特别功能都可以交给 Agent 快速实现，DIY 空间没有上限 |
+
+## 使用方法
+
+**10min · 无门槛**
+
+> **使用 Codex-5.6 或更高水平的 AI Agent 模型，拉取当前项目并遵循指令即可。**
+
+<p align="center">
+  <img src="showcase/assets/feishu-bridge-demo.png" width="420" alt="飞书桥实际使用效果">
+</p>
 
 <div align="center">
 
