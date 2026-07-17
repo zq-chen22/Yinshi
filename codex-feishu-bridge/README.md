@@ -48,7 +48,9 @@
 > **使用 Codex-5.6 或更高水平的 AI Agent 模型，拉取当前项目并遵循指令即可。**
 
 <p align="center">
-  <img src="showcase/assets/feishu-bridge-demo.png" width="420" alt="飞书桥实际使用效果">
+  <img src="showcase/assets/feishu-bridge-demo.png" width="40%" alt="飞书桥多设备会话列表">
+  &nbsp;
+  <img src="showcase/assets/feishu-card-demo.png" width="40%" alt="飞书桥卡片与文件交付">
 </p>
 
 <div align="center">
