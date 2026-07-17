@@ -16,38 +16,24 @@
 
 ## 我们的功能
 
-<p><strong>01 / 不同设备</strong><br>
-&emsp;在飞书里协调不同设备上的 Codex</p>
-
-<p><strong>02 / 状态同步</strong><br>
-&emsp;飞书任务中的思考状态、进展与计划，可通过飞书卡片及时同步</p>
-
-<p><strong>03 / 文件流转</strong><br>
-&emsp;支持上传文件、图片和视频；任务完成后，Codex 会发来必要的图片、文件和视频</p>
-
-> 飞书图片和 `view_image` 会在读取前强制改写为最长边 1024px 的物理 JPEG 代理；代理失败时拒绝读取，不回退到原图。桥不提前压缩 Codex 上下文。
-
-<p><strong>04 / 无需梯子</strong><br>
-&emsp;没有梯子，也能流畅使用 Codex</p>
-
-> 从本机 Codex 窗口产生的对话，只同步用户提问与完整结束后的最终回复；思考、工具调用和中间进度不会同步。
+<p>
+<strong>01 / 不同设备</strong>&ensp;在飞书里协调不同设备上的 Codex<br>
+<strong>02 / 状态同步</strong>&ensp;飞书任务中的思考状态、进展与计划，可通过飞书卡片及时同步<br>
+<strong>03 / 文件流转</strong>&ensp;支持上传文件、图片和视频；任务完成后，Codex 会发来必要的图片、文件和视频<br>
+<strong>04 / 无需梯子</strong>&ensp;没有梯子，也能流畅使用 Codex
+</p>
 
 ## 我们的承诺
 
-<p><strong>01 / 放心使用</strong><br>
-&emsp;不植入病毒，不加入恶意指令</p>
-
-<p><strong>02 / 真实稳定</strong><br>
-&emsp;每人每天 100+ 轮次对话，持续稳定运行</p>
-
-<p><strong>03 / 无限 DIY</strong><br>
-&emsp;特别功能都可以交给 Agent 快速实现，DIY 空间没有上限</p>
+<p>
+<strong>01 / 放心使用</strong>&ensp;不植入病毒，不加入恶意指令<br>
+<strong>02 / 真实稳定</strong>&ensp;每人每天 100+ 轮次对话，持续稳定运行<br>
+<strong>03 / 无限 DIY</strong>&ensp;特别功能都可以交给 Agent 快速实现，DIY 空间没有上限
+</p>
 
 ## 使用方法
 
-**10min · 无门槛**
-
-> **使用 Codex-5.6 或更高水平的 AI Agent 模型，拉取当前项目并遵循指令即可。**
+<p><strong>10min · 无门槛</strong>&ensp;使用 Codex-5.6 或更高水平的 AI Agent 模型，拉取当前项目并遵循指令即可。</p>
 
 <p align="center">
   <img src="showcase/assets/feature-multi-device.png" width="32%" alt="多端协作，随时继续对话">
