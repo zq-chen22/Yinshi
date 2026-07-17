@@ -50,9 +50,9 @@
 > **使用 Codex-5.6 或更高水平的 AI Agent 模型，拉取当前项目并遵循指令即可。**
 
 <p align="center">
-  <img src="showcase/assets/feature-multi-device.png" width="32%" alt="同时在多个设备上进行对话">
-  <img src="showcase/assets/feature-progress-report.png" width="32%" alt="汇报实时进度和计划">
-  <img src="showcase/assets/feature-image-download.png" width="32%" alt="处理并下载图片">
+  <img src="showcase/assets/feature-multi-device.png" width="32%" alt="多端协作，随时继续对话">
+  <img src="showcase/assets/feature-progress-report.png" width="32%" alt="实时汇报，进度计划可见">
+  <img src="showcase/assets/feature-image-download.png" width="32%" alt="图片处理，完成即可下载">
 </p>
 
 <div align="center">
