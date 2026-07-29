@@ -242,6 +242,96 @@ def test_incoming_queue_is_durable_and_message_idempotent(tmp_path):
         db.close()
 
 
+def test_cancel_chat_incoming_is_cutoff_scoped_and_restart_safe(tmp_path):
+    db = BridgeDB(tmp_path / "bridge.sqlite")
+
+    def message(
+        message_id: str,
+        *,
+        created: int,
+        chat_id: str = "oc_target",
+        role: str = "conversation",
+    ) -> IncomingMessage:
+        return IncomingMessage(
+            message_id=message_id,
+            chat_id=chat_id,
+            chat_type="group",
+            app_role=role,  # type: ignore[arg-type]
+            sender_open_id="ou_owner",
+            sender_user_id=None,
+            sender_union_id="on_owner",
+            text=message_id,
+            message_type="text",
+            create_time_ms=created,
+        )
+
+    def claim_as(message_id: str, state: str, created: int) -> None:
+        assert db.enqueue_incoming(message(message_id, created=created)) is True
+        claimed = db.claim_incoming("worker")
+        assert claimed is not None
+        assert claimed.message.message_id == message_id
+        if state == "processing":
+            return
+        if state == "retry":
+            db.fail_incoming(message_id, "retry", retry_after_seconds=60)
+        elif state == "queued":
+            db.mark_incoming_queued(message_id)
+        elif state == "held":
+            db.hold_incoming_attachments(claimed.message)
+        elif state == "dispatching":
+            assert db.mark_incoming_dispatching(message_id) is True
+        elif state == "done":
+            db.complete_incoming(message_id)
+        else:
+            raise AssertionError(state)
+
+    try:
+        claim_as("om-processing", "processing", 10)
+        claim_as("om-retry", "retry", 20)
+        claim_as("om-queued", "queued", 30)
+        claim_as("om-held", "held", 40)
+        claim_as("om-dispatching", "dispatching", 50)
+        claim_as("om-done", "done", 60)
+        assert db.enqueue_incoming(message("om-pending", created=70)) is True
+        assert db.enqueue_incoming(message("om-command", created=80)) is True
+        assert db.enqueue_incoming(
+            message("om-other-chat", created=70, chat_id="oc_other")
+        )
+        assert db.enqueue_incoming(
+            message("om-other-role", created=70, role="admin")
+        )
+        assert db.enqueue_incoming(message("om-future", created=110)) is True
+
+        cancelled = db.cancel_chat_incoming(
+            "conversation",
+            "oc_target",
+            before_or_at_ms=100,
+            exclude_message_id="om-command",
+            reason="test stop",
+        )
+        assert set(cancelled) == {
+            "om-processing",
+            "om-retry",
+            "om-queued",
+            "om-held",
+            "om-pending",
+        }
+        for message_id in cancelled:
+            assert db.inbox_state(message_id) == "cancelled"
+        assert db.inbox_state("om-command") == "pending"
+        assert db.inbox_state("om-other-chat") == "pending"
+        assert db.inbox_state("om-other-role") == "pending"
+        assert db.inbox_state("om-future") == "pending"
+        assert db.inbox_state("om-dispatching") == "dispatching"
+        assert db.inbox_state("om-done") == "done"
+
+        assert db.recover_inbox_after_restart() == ["om-dispatching"]
+        for message_id in cancelled:
+            assert db.inbox_state(message_id) == "cancelled"
+    finally:
+        db.close()
+
+
 def test_thread_lease_excludes_other_worker(tmp_path):
     db = BridgeDB(tmp_path / "bridge.sqlite")
     try:

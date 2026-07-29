@@ -104,9 +104,13 @@ class BridgeService:
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._thread_queues: dict[str, asyncio.Queue[ScheduledMessage]] = {}
         self._thread_workers: dict[str, asyncio.Task[None]] = {}
+        self._thread_worker_jobs: dict[str, ScheduledMessage] = {}
         self._admin_queue: asyncio.Queue[ScheduledMessage] = asyncio.Queue()
+        self._admin_worker_job: ScheduledMessage | None = None
         self._active_by_thread: dict[str, ActiveTurn] = {}
         self._active_by_turn: dict[str, ActiveTurn] = {}
+        self._append_to_turn: dict[tuple[AppRole, str], tuple[str, str]] = {}
+        self._stop_requested_chats: set[tuple[AppRole, str]] = set()
         self._turn_done: dict[str, asyncio.Event] = {}
         self._pending_jobs: dict[str, ScheduledMessage] = {}
         self._pending_recoveries: dict[str, TurnJob] = {}
@@ -189,6 +193,8 @@ class BridgeService:
             or self._pending_jobs
             or self._pending_recoveries
             or self._finalizing
+            or self._thread_worker_jobs
+            or self._admin_worker_job is not None
             or queued
             or not self._admin_queue.empty()
             or outbound_pending
@@ -402,6 +408,8 @@ class BridgeService:
                 f"**线程：** `{binding.thread_id}`\n\n"
                 "直接发消息会在这个 Codex 上下文中开启下一轮；执行中用 "
                 "`!steer 补充要求` 立即修正，用 `!stop` 停止，用 `!status` 查看状态，"
+                "也可单独发送 `追加信息` 将等待消息并入当前轮，或发送 "
+                "`停止任务` 中断当前轮并清空等待队列；"
                 "用 `!帮助` 查看模型、速度与权限配置命令。",
                 color="green",
             ),
@@ -633,6 +641,13 @@ class BridgeService:
                 )
             )
             if turn_id not in self._active_by_turn:
+                self._migrate_append_target(
+                    app_role=job.app_role,
+                    chat_id=job.chat_id,
+                    thread_id=job.thread_id,
+                    old_turn_id=old_turn_id,
+                    new_turn_id=turn_id,
+                )
                 self._register_active(
                     ActiveTurn(
                         thread_id=job.thread_id,
@@ -719,6 +734,11 @@ class BridgeService:
                     progress_card("Codex 状态待核对", text, color="red"),
                 )
         self._turn_done.setdefault(active.turn_id, asyncio.Event()).set()
+        self._clear_append_target(
+            active.app_role,
+            active.chat_id,
+            turn_id=active.turn_id,
+        )
         self._active_by_turn.pop(active.turn_id, None)
         if self._active_by_thread.get(active.thread_id) is active:
             self._active_by_thread.pop(active.thread_id, None)
@@ -1093,6 +1113,528 @@ class BridgeService:
             self.db.set_setting(f"owner_chat_id:{message.app_role}", message.chat_id)
         return True
 
+    @staticmethod
+    def _chat_key(app_role: AppRole, chat_id: str) -> tuple[AppRole, str]:
+        return app_role, chat_id
+
+    @staticmethod
+    def _append_setting_key(app_role: AppRole, chat_id: str) -> str:
+        return f"append_turn:{app_role}:{chat_id}"
+
+    @staticmethod
+    def _deferred_stop_setting_key(app_role: AppRole, chat_id: str) -> str:
+        return f"deferred_stop:{app_role}:{chat_id}"
+
+    def _read_deferred_stop_targets(
+        self,
+        app_role: AppRole,
+        chat_id: str,
+    ) -> set[str]:
+        raw = (
+            self.db.get_setting(
+                self._deferred_stop_setting_key(app_role, chat_id),
+                "",
+            )
+            or ""
+        )
+        if not raw:
+            return set()
+        try:
+            parsed = json.loads(raw)
+            targets = {
+                str(value)
+                for value in parsed.get("message_ids", [])
+                if str(value)
+            }
+        except (AttributeError, TypeError, ValueError):
+            self.db.delete_setting(
+                self._deferred_stop_setting_key(app_role, chat_id)
+            )
+            return set()
+        return targets
+
+    def _set_deferred_stop_targets(
+        self,
+        app_role: AppRole,
+        chat_id: str,
+        message_ids: set[str],
+    ) -> None:
+        if not message_ids:
+            return
+        targets = self._read_deferred_stop_targets(app_role, chat_id)
+        targets.update(message_ids)
+        self.db.set_setting(
+            self._deferred_stop_setting_key(app_role, chat_id),
+            json.dumps({"message_ids": sorted(targets)}, ensure_ascii=False),
+        )
+        self._stop_requested_chats.add(self._chat_key(app_role, chat_id))
+
+    def _clear_deferred_stop_targets(
+        self,
+        app_role: AppRole,
+        chat_id: str,
+        *,
+        message_ids: set[str] | None = None,
+    ) -> None:
+        targets = self._read_deferred_stop_targets(app_role, chat_id)
+        if message_ids is not None:
+            targets.difference_update(message_ids)
+        else:
+            targets.clear()
+        key = self._chat_key(app_role, chat_id)
+        if targets:
+            self.db.set_setting(
+                self._deferred_stop_setting_key(app_role, chat_id),
+                json.dumps({"message_ids": sorted(targets)}, ensure_ascii=False),
+            )
+            self._stop_requested_chats.add(key)
+            return
+        self.db.delete_setting(self._deferred_stop_setting_key(app_role, chat_id))
+        self._stop_requested_chats.discard(key)
+
+    def _read_append_target(
+        self, app_role: AppRole, chat_id: str
+    ) -> tuple[str, str] | None:
+        key = self._chat_key(app_role, chat_id)
+        cached = self._append_to_turn.get(key)
+        if cached:
+            return cached
+        raw = self.db.get_setting(self._append_setting_key(app_role, chat_id), "") or ""
+        if not raw:
+            return None
+        try:
+            parsed = json.loads(raw)
+            target = str(parsed["thread_id"]), str(parsed["turn_id"])
+            if not all(target):
+                raise ValueError("empty append target")
+        except (KeyError, TypeError, ValueError):
+            self.db.delete_setting(self._append_setting_key(app_role, chat_id))
+            return None
+        self._append_to_turn[key] = target
+        return target
+
+    def _set_append_target(self, active: ActiveTurn) -> None:
+        key = self._chat_key(active.app_role, active.chat_id)
+        target = active.thread_id, active.turn_id
+        self._append_to_turn[key] = target
+        self.db.set_setting(
+            self._append_setting_key(active.app_role, active.chat_id),
+            json.dumps(
+                {"thread_id": active.thread_id, "turn_id": active.turn_id},
+                ensure_ascii=False,
+            ),
+        )
+
+    def _migrate_append_target(
+        self,
+        *,
+        app_role: AppRole,
+        chat_id: str,
+        thread_id: str,
+        old_turn_id: str,
+        new_turn_id: str,
+    ) -> None:
+        if self._read_append_target(app_role, chat_id) != (
+            thread_id,
+            old_turn_id,
+        ):
+            return
+        self._set_append_target(
+            ActiveTurn(
+                thread_id=thread_id,
+                turn_id=new_turn_id,
+                app_role=app_role,
+                chat_id=chat_id,
+            )
+        )
+
+    def _clear_append_target(
+        self,
+        app_role: AppRole,
+        chat_id: str,
+        *,
+        turn_id: str | None = None,
+    ) -> None:
+        current = self._read_append_target(app_role, chat_id)
+        if turn_id is not None and current and current[1] != turn_id:
+            return
+        self._append_to_turn.pop(self._chat_key(app_role, chat_id), None)
+        self.db.delete_setting(self._append_setting_key(app_role, chat_id))
+
+    def _active_for_chat(
+        self,
+        app_role: AppRole,
+        chat_id: str,
+        *,
+        thread_id: str | None = None,
+    ) -> ActiveTurn | None:
+        if thread_id:
+            active = self._active_by_thread.get(thread_id)
+            if (
+                active
+                and active.app_role == app_role
+                and active.chat_id == chat_id
+            ):
+                return active
+            return None
+        matches = [
+            active
+            for active in self._active_by_turn.values()
+            if active.app_role == app_role and active.chat_id == chat_id
+        ]
+        return max(matches, key=lambda value: value.started_monotonic) if matches else None
+
+    def _append_active_for_chat(
+        self,
+        app_role: AppRole,
+        chat_id: str,
+        *,
+        thread_id: str | None = None,
+    ) -> ActiveTurn | None:
+        target = self._read_append_target(app_role, chat_id)
+        if not target:
+            return None
+        target_thread, target_turn = target
+        if thread_id and target_thread != thread_id:
+            self._clear_append_target(app_role, chat_id)
+            return None
+        active = self._active_by_turn.get(target_turn)
+        if (
+            not active
+            or active.thread_id != target_thread
+            or active.app_role != app_role
+            or active.chat_id != chat_id
+        ):
+            self._clear_append_target(app_role, chat_id)
+            return None
+        return active
+
+    @staticmethod
+    def _drain_queue_matching(
+        queue: asyncio.Queue[ScheduledMessage],
+        predicate: Any,
+    ) -> list[ScheduledMessage]:
+        selected: list[ScheduledMessage] = []
+        retained: list[ScheduledMessage] = []
+        while True:
+            try:
+                job = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            queue.task_done()
+            if predicate(job):
+                selected.append(job)
+            else:
+                retained.append(job)
+        for job in retained:
+            queue.put_nowait(job)
+        return selected
+
+    def _drain_waiting_jobs(
+        self,
+        app_role: AppRole,
+        chat_id: str,
+        *,
+        thread_id: str | None = None,
+        message_ids: set[str] | None = None,
+    ) -> tuple[list[ScheduledMessage], set[str]]:
+        def selected(job: ScheduledMessage) -> bool:
+            if job.app_role != app_role or job.chat_id != chat_id:
+                return False
+            job_id = job.inbox.message.message_id
+            if message_ids is not None:
+                return job_id in message_ids
+            return self.db.inbox_state(job_id) == "queued"
+
+        jobs: list[ScheduledMessage] = []
+        worker_owned: set[str] = set()
+        if thread_id:
+            current = self._thread_worker_jobs.get(thread_id)
+            if current and selected(current):
+                jobs.append(current)
+                worker_owned.add(current.inbox.message.message_id)
+            queue = self._thread_queues.get(thread_id)
+            if queue:
+                jobs.extend(self._drain_queue_matching(queue, selected))
+        else:
+            current = self._admin_worker_job
+            if current and selected(current):
+                jobs.append(current)
+                worker_owned.add(current.inbox.message.message_id)
+            jobs.extend(self._drain_queue_matching(self._admin_queue, selected))
+        jobs.sort(
+            key=lambda job: (
+                job.inbox.message.create_time_ms,
+                job.inbox.message.message_id,
+            )
+        )
+        return jobs, worker_owned
+
+    def _requeue_drained_jobs(
+        self,
+        jobs: list[ScheduledMessage],
+        *,
+        worker_owned: set[str],
+        thread_id: str | None,
+    ) -> None:
+        for job in jobs:
+            message_id = job.inbox.message.message_id
+            if message_id in worker_owned or self.db.inbox_state(message_id) != "queued":
+                continue
+            if thread_id:
+                self._thread_queues.setdefault(thread_id, asyncio.Queue()).put_nowait(job)
+            else:
+                self._admin_queue.put_nowait(job)
+
+    async def _patch_controlled_job(
+        self,
+        job: ScheduledMessage,
+        *,
+        title: str,
+        text: str,
+        color: str,
+    ) -> None:
+        if not job.progress_message_id:
+            return
+        card = progress_card(title, text, color=color)
+        try:
+            await self.gateway.patch_card(
+                job.app_role,
+                job.progress_message_id,
+                card,
+            )
+        except Exception:
+            LOG.warning(
+                "Control card update failed for %s; queued durable retry",
+                job.inbox.message.message_id,
+                exc_info=True,
+            )
+            outbox_key = f"control-card:{job.inbox.message.message_id}:{_text_hash(title)}"
+            self.db.enqueue_outbox(
+                OutboxItem(
+                    outbox_key=outbox_key,
+                    app_role=job.app_role,
+                    receive_id=job.chat_id,
+                    receive_id_type="chat_id",
+                    msg_type="card_patch",
+                    content={
+                        "message_id": job.progress_message_id,
+                        "card": card,
+                    },
+                    group_key=outbox_key,
+                    sequence=0,
+                )
+            )
+
+    def _dispatching_job_ids_for_chat(
+        self,
+        app_role: AppRole,
+        chat_id: str,
+    ) -> set[str]:
+        candidates = [
+            *self._pending_jobs.values(),
+            *self._thread_worker_jobs.values(),
+        ]
+        if self._admin_worker_job:
+            candidates.append(self._admin_worker_job)
+        return {
+            job.inbox.message.message_id
+            for job in candidates
+            if job.app_role == app_role
+            and job.chat_id == chat_id
+            and self.db.inbox_state(job.inbox.message.message_id) == "dispatching"
+        }
+
+    async def _stop_chat_tasks(
+        self,
+        item: InboxItem,
+        *,
+        thread_id: str | None,
+    ) -> None:
+        message = item.message
+        key = self._chat_key(message.app_role, message.chat_id)
+        self._clear_append_target(message.app_role, message.chat_id)
+        active = self._active_for_chat(
+            message.app_role,
+            message.chat_id,
+            thread_id=thread_id,
+        )
+        dispatching_ids = self._dispatching_job_ids_for_chat(
+            message.app_role,
+            message.chat_id,
+        )
+        if not active and dispatching_ids:
+            self._set_deferred_stop_targets(
+                message.app_role,
+                message.chat_id,
+                dispatching_ids,
+            )
+
+        reason = f"cancelled by stop command {message.message_id}"
+        cancelled = set(
+            self.db.cancel_chat_incoming(
+                message.app_role,
+                message.chat_id,
+                before_or_at_ms=message.create_time_ms,
+                exclude_message_id=message.message_id,
+                reason=reason,
+            )
+        )
+        jobs, _ = self._drain_waiting_jobs(
+            message.app_role,
+            message.chat_id,
+            thread_id=thread_id,
+            message_ids=cancelled,
+        )
+        interrupted = False
+        if active:
+            self._clear_deferred_stop_targets(
+                message.app_role,
+                message.chat_id,
+            )
+            self.db.set_turn_job_state(active.turn_id, "abandoned")
+            try:
+                await self.codex.interrupt_turn(active.thread_id, active.turn_id)
+            except Exception:
+                self.db.compare_and_set_turn_job_state(
+                    active.turn_id,
+                    expected="abandoned",
+                    state="accepted",
+                )
+                raise
+            interrupted = True
+
+        # Catch older history rows that became claimable while the interrupt RPC
+        # was in flight. Newer messages remain valid work after this command.
+        cancelled.update(
+            self.db.cancel_chat_incoming(
+                message.app_role,
+                message.chat_id,
+                before_or_at_ms=message.create_time_ms,
+                exclude_message_id=message.message_id,
+                reason=reason,
+            )
+        )
+        more_jobs, _ = self._drain_waiting_jobs(
+            message.app_role,
+            message.chat_id,
+            thread_id=thread_id,
+            message_ids=cancelled,
+        )
+        known = {job.inbox.message.message_id for job in jobs}
+        jobs.extend(
+            job
+            for job in more_jobs
+            if job.inbox.message.message_id not in known
+        )
+        for job in jobs:
+            await self._patch_controlled_job(
+                job,
+                title="Codex 已取消",
+                text="这条等待任务已被“停止任务”清除，不会再启动。",
+                color="orange",
+            )
+
+        self.db.complete_incoming(message.message_id)
+        pending_stop = key in self._stop_requested_chats
+        if interrupted:
+            prefix = "已停止当前任务"
+        elif pending_stop:
+            prefix = "当前任务正在启动，已登记停止请求"
+        else:
+            prefix = "当前没有正在执行的任务"
+        await self.gateway.send_text(
+            message.app_role,
+            message.chat_id,
+            f"⏹️ {prefix}；已清除 {len(cancelled)} 条后续等待任务。",
+            idempotency_key=f"stop-all:{message.message_id}",
+        )
+
+    async def _enable_append_mode(
+        self,
+        item: InboxItem,
+        *,
+        active: ActiveTurn | None,
+        thread_id: str | None,
+    ) -> None:
+        message = item.message
+        if not active:
+            self._clear_append_target(message.app_role, message.chat_id)
+            self.db.complete_incoming(message.message_id)
+            await self.gateway.send_text(
+                message.app_role,
+                message.chat_id,
+                "当前没有正在执行的任务，无法开启“追加信息”。",
+                idempotency_key=f"append-none:{message.message_id}",
+            )
+            return
+
+        self._set_append_target(active)
+        jobs, worker_owned = self._drain_waiting_jobs(
+            message.app_role,
+            message.chat_id,
+            thread_id=thread_id,
+        )
+        appended = 0
+        append_error = ""
+        for index, job in enumerate(jobs):
+            if self.db.inbox_state(job.inbox.message.message_id) != "queued":
+                continue
+            try:
+                steered = await self._steer(
+                    job.inbox,
+                    active,
+                    acknowledge=False,
+                    queue_on_terminal=False,
+                )
+            except Exception as error:
+                LOG.warning(
+                    "Could not prepare queued message %s for append mode",
+                    job.inbox.message.message_id,
+                    exc_info=True,
+                )
+                append_error = type(error).__name__
+                self._requeue_drained_jobs(
+                    jobs[index:],
+                    worker_owned=worker_owned,
+                    thread_id=thread_id,
+                )
+                break
+            if not steered:
+                self._requeue_drained_jobs(
+                    jobs[index:],
+                    worker_owned=worker_owned,
+                    thread_id=thread_id,
+                )
+                break
+            appended += 1
+            await self._patch_controlled_job(
+                job,
+                title="已追加到当前任务",
+                text="这条等待信息已通过 Codex 的引导输入送入当前执行。",
+                color="blue",
+            )
+
+        still_active = self._append_active_for_chat(
+            message.app_role,
+            message.chat_id,
+            thread_id=thread_id,
+        )
+        self.db.complete_incoming(message.message_id)
+        suffix = (
+            "；在本轮结束前，之后发送的普通消息也会直接追加。"
+            if still_active
+            else "；当前任务已结束，追加模式已自动关闭。"
+        )
+        if append_error:
+            suffix += f" 本次准备输入时遇到 {append_error}，尚未处理的消息仍保留在原队列。"
+        await self.gateway.send_text(
+            message.app_role,
+            message.chat_id,
+            f"↪️ 已开启追加信息模式，并追加 {appended} 条等待消息{suffix}",
+            idempotency_key=f"append-mode:{message.message_id}",
+        )
+
     async def _route_conversation(self, item: InboxItem) -> None:
         message = item.message
         binding = self.db.get_binding_by_chat(message.chat_id)
@@ -1106,6 +1648,20 @@ class BridgeService:
             self.db.complete_incoming(message.message_id)
             return
         text = message.text.strip()
+        if text == "停止任务":
+            await self._stop_chat_tasks(item, thread_id=binding.thread_id)
+            return
+        if text == "追加信息":
+            await self._enable_append_mode(
+                item,
+                active=self._active_for_chat(
+                    message.app_role,
+                    message.chat_id,
+                    thread_id=binding.thread_id,
+                ),
+                thread_id=binding.thread_id,
+            )
+            return
         if text == "!status":
             active = self._active_by_thread.get(binding.thread_id)
             queue = self._thread_queues.get(binding.thread_id)
@@ -1143,8 +1699,17 @@ class BridgeService:
             active = self._active_by_thread.get(binding.thread_id)
             if active:
                 self.db.merge_held_attachments(message)
-                await self._steer(item, binding, active)
+                await self._steer(item, active)
                 return
+        append_active = self._append_active_for_chat(
+            message.app_role,
+            message.chat_id,
+            thread_id=binding.thread_id,
+        )
+        if append_active:
+            self.db.merge_held_attachments(message)
+            await self._steer(item, append_active)
+            return
         self.db.merge_held_attachments(message)
         await self._queue_thread_message(item, binding)
 
@@ -1688,11 +2253,18 @@ class BridgeService:
             )
         return True
 
-    async def _steer(self, item: InboxItem, binding: Binding, active: ActiveTurn) -> None:
+    async def _steer(
+        self,
+        item: InboxItem,
+        active: ActiveTurn,
+        *,
+        acknowledge: bool = True,
+        queue_on_terminal: bool = True,
+    ) -> bool:
         message = item.message
         try:
             persisted_turn = await self._find_turn_summary(
-                binding.thread_id, active.turn_id
+                active.thread_id, active.turn_id
             )
             if persisted_turn and persisted_turn.get("status") in {
                 "completed",
@@ -1703,8 +2275,17 @@ class BridgeService:
                 # is already terminal.  Deliver that result first and preserve
                 # the user's correction as a new FIFO turn.
                 await self._finalize_turn(active, persisted_turn)
-                await self._queue_thread_message(item, binding)
-                return
+                if queue_on_terminal:
+                    binding = self.db.get_binding_by_chat(message.chat_id)
+                    if (
+                        message.app_role == "conversation"
+                        and message.chat_type != "p2p"
+                        and binding
+                    ):
+                        await self._queue_thread_message(item, binding)
+                    else:
+                        await self._queue_admin_message(item)
+                return False
         except Exception:
             LOG.warning(
                 "Could not preflight turn %s before steering; falling back to turn/steer",
@@ -1712,10 +2293,11 @@ class BridgeService:
                 exc_info=True,
             )
         inputs = await self.artifacts.prepare_inputs(message)
-        self.db.mark_incoming_dispatching(message.message_id)
+        if not self.db.mark_incoming_dispatching(message.message_id):
+            return False
         try:
             await self.codex.steer_turn(
-                binding.thread_id,
+                active.thread_id,
                 active.turn_id,
                 inputs,
                 client_message_id=message.message_id,
@@ -1724,17 +2306,19 @@ class BridgeService:
             # Completion may have raced with steering.  Queue it as the next
             # turn rather than dropping the user's correction.
             self.db.fail_incoming(message.message_id, "steer raced with completion", retry_after_seconds=0)
-            return
+            return False
         except Exception as error:
             self._record_incoming_failure(item, error)
-            return
+            return False
         self.db.complete_incoming(message.message_id)
-        await self.gateway.send_text(
-            "conversation",
-            message.chat_id,
-            "↪️ 已把补充要求送入当前执行。",
-            idempotency_key=f"steered:{message.message_id}",
-        )
+        if acknowledge:
+            await self.gateway.send_text(
+                message.app_role,
+                message.chat_id,
+                "↪️ 已把补充要求送入当前执行。",
+                idempotency_key=f"steered:{message.message_id}",
+            )
+        return True
 
     async def _queue_thread_message(self, item: InboxItem, binding: Binding) -> None:
         queue = self._thread_queues.setdefault(binding.thread_id, asyncio.Queue())
@@ -1746,7 +2330,9 @@ class BridgeService:
             item.message.chat_id,
             progress_card(
                 "Codex 已接单",
-                text + "\n\n执行中可以发送 `!steer 补充要求`；发送 `!stop` 可停止当前轮。",
+                text
+                + "\n\n执行中可发送 `!steer 补充要求`；单独发送 `追加信息` "
+                "会把等待消息并入当前轮，发送 `停止任务` 会中断并清空等待队列。",
             ),
             idempotency_key=f"progress:{item.message.message_id}",
         )
@@ -1768,6 +2354,7 @@ class BridgeService:
         queue = self._thread_queues[thread_id]
         while not self._stop.is_set():
             job = await queue.get()
+            self._thread_worker_jobs[thread_id] = job
             try:
                 await self._execute_job(thread_id, job)
             except asyncio.CancelledError:
@@ -1782,13 +2369,37 @@ class BridgeService:
                 elif state == "dispatching":
                     self._record_incoming_failure(job.inbox, error)
             finally:
+                if self._thread_worker_jobs.get(thread_id) is job:
+                    self._thread_worker_jobs.pop(thread_id, None)
+                if (
+                    job.inbox.message.message_id
+                    in self._read_deferred_stop_targets(
+                        job.app_role,
+                        job.chat_id,
+                    )
+                    and not self._active_for_chat(job.app_role, job.chat_id)
+                    and self.db.inbox_state(job.inbox.message.message_id)
+                    != "dispatching"
+                ):
+                    self._clear_deferred_stop_targets(
+                        job.app_role,
+                        job.chat_id,
+                        message_ids={job.inbox.message.message_id},
+                    )
                 queue.task_done()
 
     async def _execute_job(self, thread_id: str, job: ScheduledMessage) -> None:
         message = job.inbox.message
+        if self.db.inbox_state(message.message_id) not in {"processing", "queued"}:
+            return
         while active := self._active_by_thread.get(thread_id):
             await self._turn_done.setdefault(active.turn_id, asyncio.Event()).wait()
-        await self._wait_thread_available(thread_id, job)
+        if self.db.inbox_state(message.message_id) not in {"processing", "queued"}:
+            return
+        if not await self._wait_thread_available(thread_id, job):
+            return
+        if self.db.inbox_state(message.message_id) not in {"processing", "queued"}:
+            return
         lease_ttl = 300
         if not self.db.acquire_thread_lease(
             thread_id, self.worker_id, ttl_seconds=lease_ttl
@@ -1798,7 +2409,8 @@ class BridgeService:
         try:
             runtime = self._runtime_settings(thread_id)
             inputs = await self.artifacts.prepare_inputs(message)
-            self.db.mark_incoming_dispatching(message.message_id)
+            if not self.db.mark_incoming_dispatching(message.message_id):
+                return
             self._pending_jobs[thread_id] = job
             try:
                 turn = await self.codex.start_turn(
@@ -1871,9 +2483,14 @@ class BridgeService:
 
     async def _wait_thread_available(
         self, thread_id: str, job: ScheduledMessage
-    ) -> None:
+    ) -> bool:
         last_notice = ""
         while not self._stop.is_set():
+            if self.db.inbox_state(job.inbox.message.message_id) not in {
+                "processing",
+                "queued",
+            }:
+                return False
             blocked_turn = self.db.get_setting(f"blocked_thread:{thread_id}", "") or ""
             if blocked_turn:
                 notice = f"thread 已安全锁定，等待管理员核对并解除：`{blocked_turn}`"
@@ -1887,7 +2504,7 @@ class BridgeService:
             )
             if override_until >= int(time.time()):
                 self.db.delete_setting(f"thread_override_until:{thread_id}")
-                return
+                return True
             try:
                 raw = await self.codex.read_thread(thread_id, include_turns=False)
                 turns = await self._turn_summaries(
@@ -1941,7 +2558,7 @@ class BridgeService:
                     last_notice = notice
                 await asyncio.sleep(min(3, max(0.5, 10 - age)))
                 continue
-            return
+            return True
         raise asyncio.CancelledError
 
     async def _patch_job_waiting(self, job: ScheduledMessage, text: str) -> None:
@@ -1955,6 +2572,16 @@ class BridgeService:
     async def _route_admin(self, item: InboxItem) -> None:
         message = item.message
         text = message.text.strip()
+        if text == "停止任务":
+            await self._stop_chat_tasks(item, thread_id=None)
+            return
+        if text == "追加信息":
+            await self._enable_append_mode(
+                item,
+                active=self._active_for_chat(message.app_role, message.chat_id),
+                thread_id=None,
+            )
+            return
         if text in {"帮助", "/help", "help"}:
             reply = (
                 "Codex 私聊命令：\n"
@@ -1965,6 +2592,8 @@ class BridgeService:
                 "• `状态`：查看桥接服务状态\n"
                 "• `待确认` / `重试 消息ID` / `忽略 消息ID`：处理崩溃临界区消息\n"
                 "• `解除线程 threadID`：本机核对进程中断的 turn 后解除安全锁\n"
+                "• `追加信息`：把等待消息及本轮结束前的新消息引导进当前任务\n"
+                "• `停止任务`：停止当前任务并清空已经等待的后续任务\n"
                 "• `/model` / `/fast` / `/permissions` / `/status`：按 Codex CLI 方式管理临时任务配置\n"
                 "• `/compat`：检测并修复 CLI 升级后的设置兼容门禁\n"
                 "其他文字会在一个临时、上下文无关的 Codex 对话中处理。"
@@ -2098,6 +2727,18 @@ class BridgeService:
             await self._admin_reply(message, reply, "new-thread")
             self.db.complete_incoming(message.message_id)
             return
+        append_active = self._append_active_for_chat(
+            message.app_role,
+            message.chat_id,
+        )
+        if append_active:
+            self.db.merge_held_attachments(message)
+            await self._steer(item, append_active)
+            return
+        await self._queue_admin_message(item)
+
+    async def _queue_admin_message(self, item: InboxItem) -> None:
+        message = item.message
         self.db.merge_held_attachments(message)
         self.db.mark_incoming_queued(message.message_id)
         progress_id = await self.gateway.send_card(
@@ -2119,6 +2760,7 @@ class BridgeService:
     async def _admin_worker(self) -> None:
         while not self._stop.is_set():
             job = await self._admin_queue.get()
+            self._admin_worker_job = job
             thread_id: str | None = None
             message = job.inbox.message
             try:
@@ -2126,7 +2768,8 @@ class BridgeService:
                 # Creating even the context-free helper thread is an
                 # irreversible RPC.  Cross the durable ambiguity boundary
                 # before calling it so a restart cannot create duplicates.
-                self.db.mark_incoming_dispatching(message.message_id)
+                if not self.db.mark_incoming_dispatching(message.message_id):
+                    continue
                 thread = await self.codex.start_thread(
                     cwd=str(self.config.admin_scratch_dir),
                     approval_policy=runtime.approval_policy,
@@ -2198,6 +2841,22 @@ class BridgeService:
             finally:
                 if thread_id:
                     self._pending_jobs.pop(thread_id, None)
+                if self._admin_worker_job is job:
+                    self._admin_worker_job = None
+                if (
+                    job.inbox.message.message_id
+                    in self._read_deferred_stop_targets(
+                        job.app_role,
+                        job.chat_id,
+                    )
+                    and not self._active_for_chat(job.app_role, job.chat_id)
+                    and self.db.inbox_state(message.message_id) != "dispatching"
+                ):
+                    self._clear_deferred_stop_targets(
+                        job.app_role,
+                        job.chat_id,
+                        message_ids={job.inbox.message.message_id},
+                    )
                 self._admin_queue.task_done()
 
     def _is_admin_scratch_thread(self, thread: ThreadSummary) -> bool:
@@ -2348,7 +3007,13 @@ class BridgeService:
             icons = {"completed": "✅", "in_progress": "🔄", "pending": "▫️"}
             for step in active.plan[-12:]:
                 lines.append(f"{icons.get(step.get('status'), '▫️')} {step.get('step', '')}")
-        lines.extend(["", "可发送 `!steer 补充要求` 或 `!stop`。"])
+        lines.extend(
+            [
+                "",
+                "可发送 `!steer 补充要求`；单独发送 `追加信息` 可合并等待消息，"
+                "发送 `停止任务` 可中断并清空等待队列。",
+            ]
+        )
         return "\n".join(lines)
 
     async def _on_codex_notification(self, message: dict[str, Any]) -> None:
@@ -2616,6 +3281,11 @@ class BridgeService:
             if finalized:
                 self._completed_turns.add(active.turn_id)
                 self._turn_done.setdefault(active.turn_id, asyncio.Event()).set()
+                self._clear_append_target(
+                    active.app_role,
+                    active.chat_id,
+                    turn_id=active.turn_id,
+                )
                 self._active_by_turn.pop(active.turn_id, None)
                 if self._active_by_thread.get(active.thread_id) is active:
                     self._active_by_thread.pop(active.thread_id, None)
@@ -2983,6 +3653,78 @@ class BridgeService:
         self._active_by_thread[active.thread_id] = active
         self._active_by_turn[active.turn_id] = active
         self._turn_done.setdefault(active.turn_id, asyncio.Event())
+        pending = self._pending_jobs.get(active.thread_id)
+        message_id = (
+            pending.inbox.message.message_id
+            if pending
+            else self.db.turn_job_message_id(active.turn_id)
+        )
+        targets = self._read_deferred_stop_targets(
+            active.app_role,
+            active.chat_id,
+        )
+        if message_id and message_id in targets:
+            self._background_task(
+                self._interrupt_requested_active(active, message_id),
+                f"deferred-stop:{active.turn_id}",
+            )
+
+    async def _interrupt_requested_active(
+        self,
+        active: ActiveTurn,
+        message_id: str,
+    ) -> None:
+        clear_request = False
+        try:
+            for attempt in range(1, 6):
+                if message_id not in self._read_deferred_stop_targets(
+                    active.app_role,
+                    active.chat_id,
+                ):
+                    return
+                if self._active_by_turn.get(active.turn_id) is not active:
+                    clear_request = True
+                    return
+                self.db.set_turn_job_state(active.turn_id, "abandoned")
+                try:
+                    await self.codex.interrupt_turn(active.thread_id, active.turn_id)
+                except Exception as error:
+                    self.db.compare_and_set_turn_job_state(
+                        active.turn_id,
+                        expected="abandoned",
+                        state="accepted",
+                    )
+                    LOG.warning(
+                        "Deferred stop attempt %d failed for turn %s: %s",
+                        attempt,
+                        active.turn_id,
+                        error,
+                    )
+                    if attempt == 5:
+                        self._enqueue_outbound_result(
+                            app_role=active.app_role,
+                            chat_id=active.chat_id,
+                            text=(
+                                "⚠️ “停止任务”已连续 5 次无法送达 Codex。"
+                                "当前任务可能仍在执行，请查看最新进度后再次发送“停止任务”。"
+                            ),
+                            base_key=f"deferred-stop-failed:{active.turn_id}",
+                            thread_id=None,
+                            turn_id=None,
+                        )
+                        clear_request = True
+                        return
+                    await asyncio.sleep(min(8, 2 ** (attempt - 1)))
+                    continue
+                clear_request = True
+                return
+        finally:
+            if clear_request:
+                self._clear_deferred_stop_targets(
+                    active.app_role,
+                    active.chat_id,
+                    message_ids={message_id},
+                )
 
     def _owner(self, role: AppRole) -> str:
         stored = self.db.get_setting(f"owner_open_id:{role}", "") or ""

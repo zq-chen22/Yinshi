@@ -33,6 +33,7 @@ class FakeCodex:
         self.notification_handlers: list[Any] = []
         self.server_request_handler: Any = None
         self.steered: list[dict[str, Any]] = []
+        self.interrupted: list[tuple[str, str]] = []
         self.responses: list[tuple[str, dict[str, Any]]] = []
         self.pending_requests: dict[str, dict[str, Any]] = {}
         self.errors: list[tuple[str, int, str]] = []
@@ -121,6 +122,9 @@ class FakeCodex:
             }
         )
 
+    async def interrupt_turn(self, thread_id: str, turn_id: str) -> None:
+        self.interrupted.append((thread_id, turn_id))
+
     def pending_server_request(self, rpc_id: str) -> dict[str, Any] | None:
         return self.pending_requests.get(str(rpc_id))
 
@@ -130,6 +134,19 @@ class FakeCodex:
 
     async def respond_server_error(self, rpc_id: str, code: int, message: str) -> None:
         self.errors.append((str(rpc_id), code, message))
+
+
+class InterruptRetryCodex(FakeCodex):
+    def __init__(self, failures: int) -> None:
+        super().__init__()
+        self.failures = failures
+        self.interrupt_attempts = 0
+
+    async def interrupt_turn(self, thread_id: str, turn_id: str) -> None:
+        self.interrupt_attempts += 1
+        if self.interrupt_attempts <= self.failures:
+            raise RuntimeError("temporary interrupt failure")
+        await super().interrupt_turn(thread_id, turn_id)
 
 
 class FastCompletingCodex(FakeCodex):
@@ -788,6 +805,886 @@ async def test_same_thread_messages_are_fifo_and_steer_targets_the_active_turn(
         assert db.inbox_state("om-steer") == "done"
         assert gateway.texts[-1]["idempotency_key"] == "steered:om-steer"
         assert queue.empty()
+    finally:
+        blocker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await blocker
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_stop_task_interrupts_active_and_clears_waiting_fifo(
+    tmp_path: Path,
+) -> None:
+    config = make_config(
+        tmp_path,
+        owner_conversation_open_id="ou_conversation_owner",
+    )
+    db = BridgeDB(config.database_path)
+    codex = FakeCodex()
+    gateway = FakeGateway()
+    service = BridgeService(config, db, codex, gateway)  # type: ignore[arg-type]
+    bind_thread(db)
+    blocker = asyncio.create_task(asyncio.Event().wait())
+    service._thread_workers["thread-1"] = blocker
+    service._register_active(
+        ActiveTurn(
+            thread_id="thread-1",
+            turn_id="turn-live",
+            chat_id="oc_thread",
+            progress_message_id="card-live",
+        )
+    )
+    db.upsert_turn_job(
+        TurnJob(
+            message_id="om-live",
+            thread_id="thread-1",
+            turn_id="turn-live",
+            app_role="conversation",
+            chat_id="oc_thread",
+            progress_message_id="card-live",
+            state="accepted",
+        )
+    )
+
+    try:
+        for message_id, created in (("om-wait-1", 1_000), ("om-wait-2", 2_000)):
+            await service._route_incoming(
+                stage(
+                    db,
+                    incoming(message_id, text=message_id, create_time_ms=created),
+                )
+            )
+
+        command = incoming(
+            "om-stop-all",
+            text="停止任务",
+            create_time_ms=3_000,
+        )
+        await service._route_incoming(stage(db, command))
+
+        assert codex.interrupted == [("thread-1", "turn-live")]
+        assert service._thread_queues["thread-1"].empty()
+        assert db.inbox_state("om-wait-1") == "cancelled"
+        assert db.inbox_state("om-wait-2") == "cancelled"
+        assert db.inbox_state("om-stop-all") == "done"
+        assert db.list_recoverable_turn_jobs() == []
+        assert {patch["message_id"] for patch in gateway.patches} == {
+            "card-1",
+            "card-2",
+        }
+        assert "已清除 2 条" in gateway.texts[-1]["text"]
+
+        # Punctuation makes this an ordinary task; only the exact four-character
+        # command (ignoring surrounding whitespace) is intercepted.
+        ordinary = incoming(
+            "om-not-stop",
+            text="停止任务。",
+            create_time_ms=4_000,
+        )
+        await service._route_incoming(stage(db, ordinary))
+        assert db.inbox_state("om-not-stop") == "queued"
+        assert service._thread_queues["thread-1"].qsize() == 1
+    finally:
+        blocker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await blocker
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_stop_task_cancels_worker_held_job_even_without_active_turn(
+    tmp_path: Path,
+) -> None:
+    config = make_config(
+        tmp_path,
+        owner_conversation_open_id="ou_conversation_owner",
+    )
+    db = BridgeDB(config.database_path)
+    codex = FakeCodex()
+    gateway = FakeGateway()
+    service = BridgeService(config, db, codex, gateway)  # type: ignore[arg-type]
+    bind_thread(db)
+    blocker = asyncio.create_task(asyncio.Event().wait())
+    service._thread_workers["thread-1"] = blocker
+    queue: asyncio.Queue[ScheduledMessage] | None = None
+    worker_job: ScheduledMessage | None = None
+
+    try:
+        waiting = incoming(
+            "om-worker-held",
+            text="尚未启动的任务",
+            create_time_ms=1_000,
+        )
+        await service._route_incoming(stage(db, waiting))
+        queue = service._thread_queues["thread-1"]
+        worker_job = queue.get_nowait()
+        service._thread_worker_jobs["thread-1"] = worker_job
+
+        command = incoming(
+            "om-stop-worker",
+            text="停止任务",
+            create_time_ms=2_000,
+        )
+        await service._route_incoming(stage(db, command))
+
+        assert codex.interrupted == []
+        assert db.inbox_state("om-worker-held") == "cancelled"
+        assert "已清除 1 条" in gateway.texts[-1]["text"]
+        await service._execute_job("thread-1", worker_job)
+        assert db.inbox_state("om-worker-held") == "cancelled"
+    finally:
+        service._thread_worker_jobs.pop("thread-1", None)
+        if queue is not None and worker_job is not None:
+            queue.task_done()
+        blocker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await blocker
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_stop_task_cancels_real_worker_held_and_queued_jobs(
+    tmp_path: Path,
+) -> None:
+    config = make_config(
+        tmp_path,
+        owner_conversation_open_id="ou_conversation_owner",
+    )
+    db = BridgeDB(config.database_path)
+    codex = FakeCodex()
+    gateway = FakeGateway()
+    service = BridgeService(config, db, codex, gateway)  # type: ignore[arg-type]
+    bind_thread(db)
+    active = ActiveTurn(
+        thread_id="thread-1",
+        turn_id="turn-real-worker",
+        chat_id="oc_thread",
+        progress_message_id="card-live",
+    )
+    service._register_active(active)
+
+    try:
+        await service._route_incoming(
+            stage(db, incoming("om-real-held", text="第一条", create_time_ms=1_000))
+        )
+        for _ in range(100):
+            if "thread-1" in service._thread_worker_jobs:
+                break
+            await asyncio.sleep(0.01)
+        assert service._thread_worker_jobs["thread-1"].inbox.message.message_id == (
+            "om-real-held"
+        )
+        await service._route_incoming(
+            stage(db, incoming("om-real-queued", text="第二条", create_time_ms=2_000))
+        )
+        await service._route_incoming(
+            stage(db, incoming("om-real-stop", text="停止任务", create_time_ms=3_000))
+        )
+
+        assert db.inbox_state("om-real-held") == "cancelled"
+        assert db.inbox_state("om-real-queued") == "cancelled"
+        await service._finalize_turn(
+            active,
+            {
+                "id": active.turn_id,
+                "status": "interrupted",
+                "items": [],
+            },
+        )
+        for _ in range(100):
+            if "thread-1" not in service._thread_worker_jobs:
+                break
+            await asyncio.sleep(0.01)
+        assert "thread-1" not in service._thread_worker_jobs
+        assert db.inbox_state("om-real-held") == "cancelled"
+        assert db.inbox_state("om-real-queued") == "cancelled"
+    finally:
+        service._stop.set()
+        worker = service._thread_workers.get("thread-1")
+        if worker:
+            worker.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await worker
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_stop_interrupt_error_cannot_revive_concurrently_completed_turn(
+    tmp_path: Path,
+) -> None:
+    config = make_config(
+        tmp_path,
+        owner_conversation_open_id="ou_conversation_owner",
+    )
+    db = BridgeDB(config.database_path)
+    codex = FakeCodex()
+    gateway = FakeGateway()
+    service = BridgeService(config, db, codex, gateway)  # type: ignore[arg-type]
+    bind_thread(db)
+    active = ActiveTurn(
+        thread_id="thread-1",
+        turn_id="turn-concurrent-terminal",
+        chat_id="oc_thread",
+        progress_message_id="card-live",
+    )
+    service._register_active(active)
+    db.upsert_turn_job(
+        TurnJob(
+            message_id="om-active",
+            thread_id=active.thread_id,
+            turn_id=active.turn_id,
+            app_role="conversation",
+            chat_id=active.chat_id,
+            progress_message_id=active.progress_message_id,
+            state="accepted",
+        )
+    )
+
+    async def finalize_then_raise(_: str, __: str) -> None:
+        await service._finalize_turn(
+            active,
+            {
+                "id": active.turn_id,
+                "status": "completed",
+                "items": [
+                    {
+                        "type": "agentMessage",
+                        "phase": "final_answer",
+                        "text": "已在中断响应竞态中完成",
+                    }
+                ],
+            },
+        )
+        raise RuntimeError("interrupt response was lost")
+
+    codex.interrupt_turn = finalize_then_raise  # type: ignore[method-assign]
+    try:
+        command = incoming(
+            "om-concurrent-stop",
+            text="停止任务",
+            create_time_ms=2_000,
+        )
+        with pytest.raises(RuntimeError, match="response was lost"):
+            await service._route_incoming(stage(db, command))
+
+        assert service._active_by_thread == {}
+        assert service._active_by_turn == {}
+        assert db.list_recoverable_turn_jobs() == []
+        await service._recover_turn_jobs()
+        assert service._active_by_thread == {}
+        assert service._active_by_turn == {}
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_append_information_steers_waiting_and_future_messages_until_turn_ends(
+    tmp_path: Path,
+) -> None:
+    config = make_config(
+        tmp_path,
+        owner_conversation_open_id="ou_conversation_owner",
+    )
+    db = BridgeDB(config.database_path)
+    codex = FakeCodex()
+    gateway = FakeGateway()
+    service = BridgeService(config, db, codex, gateway)  # type: ignore[arg-type]
+    bind_thread(db)
+    blocker = asyncio.create_task(asyncio.Event().wait())
+    service._thread_workers["thread-1"] = blocker
+    active = ActiveTurn(
+        thread_id="thread-1",
+        turn_id="turn-live",
+        chat_id="oc_thread",
+        progress_message_id="card-live",
+    )
+    service._register_active(active)
+
+    try:
+        await service._route_incoming(
+            stage(db, incoming("om-wait-a", text="补充甲", create_time_ms=1_000))
+        )
+        await service._route_incoming(
+            stage(db, incoming("om-wait-b", text="补充乙", create_time_ms=2_000))
+        )
+        await service._route_incoming(
+            stage(db, incoming("om-append", text="追加信息", create_time_ms=3_000))
+        )
+
+        assert [value["client_message_id"] for value in codex.steered] == [
+            "om-wait-a",
+            "om-wait-b",
+        ]
+        assert [value["inputs"][0]["text"] for value in codex.steered] == [
+            "补充甲",
+            "补充乙",
+        ]
+        assert service._thread_queues["thread-1"].empty()
+        assert db.inbox_state("om-wait-a") == "done"
+        assert db.inbox_state("om-wait-b") == "done"
+        assert db.inbox_state("om-append") == "done"
+        assert "追加 2 条" in gateway.texts[-1]["text"]
+
+        future = incoming(
+            "om-future",
+            text="再补充一条",
+            create_time_ms=4_000,
+        )
+        await service._route_incoming(stage(db, future))
+        assert codex.steered[-1]["client_message_id"] == "om-future"
+        assert db.inbox_state("om-future") == "done"
+
+        await service._finalize_turn(
+            active,
+            {
+                "id": "turn-live",
+                "status": "completed",
+                "items": [
+                    {
+                        "type": "agentMessage",
+                        "phase": "final_answer",
+                        "text": "已完成",
+                    }
+                ],
+            },
+        )
+        after = incoming(
+            "om-after",
+            text="下一轮任务",
+            create_time_ms=5_000,
+        )
+        await service._route_incoming(stage(db, after))
+        assert db.inbox_state("om-after") == "queued"
+        assert service._thread_queues["thread-1"].qsize() == 1
+    finally:
+        blocker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await blocker
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_append_information_requires_active_turn_and_exact_phrase(
+    tmp_path: Path,
+) -> None:
+    config = make_config(
+        tmp_path,
+        owner_conversation_open_id="ou_conversation_owner",
+    )
+    db = BridgeDB(config.database_path)
+    codex = FakeCodex()
+    gateway = FakeGateway()
+    service = BridgeService(config, db, codex, gateway)  # type: ignore[arg-type]
+    bind_thread(db)
+    blocker = asyncio.create_task(asyncio.Event().wait())
+    service._thread_workers["thread-1"] = blocker
+
+    try:
+        await service._route_incoming(
+            stage(db, incoming("om-existing", text="已有任务", create_time_ms=1_000))
+        )
+        await service._route_incoming(
+            stage(db, incoming("om-no-active", text="追加信息", create_time_ms=2_000))
+        )
+        assert service._thread_queues["thread-1"].qsize() == 1
+        assert db.inbox_state("om-no-active") == "done"
+        assert "当前没有正在执行" in gateway.texts[-1]["text"]
+
+        await service._route_incoming(
+            stage(
+                db,
+                incoming(
+                    "om-not-append-command",
+                    text="追加信息。",
+                    create_time_ms=3_000,
+                ),
+            )
+        )
+        assert service._thread_queues["thread-1"].qsize() == 2
+        assert db.inbox_state("om-not-append-command") == "queued"
+        assert codex.steered == []
+    finally:
+        blocker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await blocker
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_append_information_handles_real_worker_held_job_without_replay(
+    tmp_path: Path,
+) -> None:
+    config = make_config(
+        tmp_path,
+        owner_conversation_open_id="ou_conversation_owner",
+    )
+    db = BridgeDB(config.database_path)
+    codex = FakeCodex()
+    gateway = FakeGateway()
+    service = BridgeService(config, db, codex, gateway)  # type: ignore[arg-type]
+    bind_thread(db)
+    active = ActiveTurn(
+        thread_id="thread-1",
+        turn_id="turn-real-append",
+        chat_id="oc_thread",
+        progress_message_id="card-live",
+    )
+    service._register_active(active)
+
+    try:
+        await service._route_incoming(
+            stage(db, incoming("om-append-held", text="补充一", create_time_ms=1_000))
+        )
+        for _ in range(100):
+            if "thread-1" in service._thread_worker_jobs:
+                break
+            await asyncio.sleep(0.01)
+        await service._route_incoming(
+            stage(db, incoming("om-append-queued", text="补充二", create_time_ms=2_000))
+        )
+        await service._route_incoming(
+            stage(db, incoming("om-append-real", text="追加信息", create_time_ms=3_000))
+        )
+
+        assert [value["client_message_id"] for value in codex.steered] == [
+            "om-append-held",
+            "om-append-queued",
+        ]
+        await service._finalize_turn(
+            active,
+            {
+                "id": active.turn_id,
+                "status": "completed",
+                "items": [
+                    {
+                        "type": "agentMessage",
+                        "phase": "final_answer",
+                        "text": "完成",
+                    }
+                ],
+            },
+        )
+        for _ in range(100):
+            if "thread-1" not in service._thread_worker_jobs:
+                break
+            await asyncio.sleep(0.01)
+        assert "thread-1" not in service._thread_worker_jobs
+        assert db.inbox_state("om-append-held") == "done"
+        assert db.inbox_state("om-append-queued") == "done"
+    finally:
+        service._stop.set()
+        worker = service._thread_workers.get("thread-1")
+        if worker:
+            worker.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await worker
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_append_information_requeues_all_jobs_when_input_preparation_fails(
+    tmp_path: Path,
+) -> None:
+    config = make_config(
+        tmp_path,
+        owner_conversation_open_id="ou_conversation_owner",
+    )
+    db = BridgeDB(config.database_path)
+    codex = FakeCodex()
+    gateway = FakeGateway()
+    service = BridgeService(config, db, codex, gateway)  # type: ignore[arg-type]
+    bind_thread(db)
+    blocker = asyncio.create_task(asyncio.Event().wait())
+    service._thread_workers["thread-1"] = blocker
+    service._register_active(
+        ActiveTurn(
+            thread_id="thread-1",
+            turn_id="turn-prepare-fails",
+            chat_id="oc_thread",
+            progress_message_id="card-live",
+        )
+    )
+
+    async def fail_prepare(_: IncomingMessage) -> list[dict[str, Any]]:
+        raise RuntimeError("input preparation failed")
+
+    service.artifacts.prepare_inputs = fail_prepare  # type: ignore[method-assign]
+    try:
+        await service._route_incoming(
+            stage(db, incoming("om-prepare-a", text="甲", create_time_ms=1_000))
+        )
+        await service._route_incoming(
+            stage(db, incoming("om-prepare-b", text="乙", create_time_ms=2_000))
+        )
+        await service._route_incoming(
+            stage(db, incoming("om-prepare-command", text="追加信息", create_time_ms=3_000))
+        )
+
+        queue = service._thread_queues["thread-1"]
+        assert queue.qsize() == 2
+        restored = [queue.get_nowait(), queue.get_nowait()]
+        assert [job.inbox.message.message_id for job in restored] == [
+            "om-prepare-a",
+            "om-prepare-b",
+        ]
+        for job in restored:
+            queue.task_done()
+        assert db.inbox_state("om-prepare-a") == "queued"
+        assert db.inbox_state("om-prepare-b") == "queued"
+        assert "仍保留在原队列" in gateway.texts[-1]["text"]
+    finally:
+        blocker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await blocker
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_append_information_requeues_remaining_fifo_if_turn_finishes_mid_batch(
+    tmp_path: Path,
+) -> None:
+    class TerminalOnSecondPreflightCodex(FakeCodex):
+        def __init__(self) -> None:
+            super().__init__()
+            self.preflights = 0
+
+        async def list_turns(
+            self,
+            thread_id: str,
+            *,
+            limit: int = 100,
+            items_view: str = "summary",
+            sort_direction: str = "desc",
+            cursor: str | None = None,
+        ) -> dict[str, Any]:
+            self.preflights += 1
+            if self.preflights == 1:
+                return {"data": [], "nextCursor": None}
+            return {
+                "data": [
+                    {
+                        "id": "turn-mid-batch",
+                        "status": "completed",
+                        "items": [
+                            {
+                                "type": "agentMessage",
+                                "phase": "final_answer",
+                                "text": "当前轮已经完成",
+                            }
+                        ],
+                    }
+                ],
+                "nextCursor": None,
+            }
+
+    config = make_config(
+        tmp_path,
+        owner_conversation_open_id="ou_conversation_owner",
+    )
+    db = BridgeDB(config.database_path)
+    codex = TerminalOnSecondPreflightCodex()
+    gateway = FakeGateway()
+    service = BridgeService(config, db, codex, gateway)  # type: ignore[arg-type]
+    bind_thread(db)
+    blocker = asyncio.create_task(asyncio.Event().wait())
+    service._thread_workers["thread-1"] = blocker
+    service._register_active(
+        ActiveTurn(
+            thread_id="thread-1",
+            turn_id="turn-mid-batch",
+            chat_id="oc_thread",
+            progress_message_id="card-live",
+        )
+    )
+
+    try:
+        for index, value in enumerate(("甲", "乙", "丙"), 1):
+            await service._route_incoming(
+                stage(
+                    db,
+                    incoming(
+                        f"om-mid-{index}",
+                        text=value,
+                        create_time_ms=index * 1_000,
+                    ),
+                )
+            )
+        await service._route_incoming(
+            stage(
+                db,
+                incoming("om-mid-command", text="追加信息", create_time_ms=4_000),
+            )
+        )
+
+        assert [value["client_message_id"] for value in codex.steered] == [
+            "om-mid-1"
+        ]
+        queue = service._thread_queues["thread-1"]
+        assert queue.qsize() == 2
+        remaining = [queue.get_nowait(), queue.get_nowait()]
+        assert [job.inbox.message.message_id for job in remaining] == [
+            "om-mid-2",
+            "om-mid-3",
+        ]
+        for job in remaining:
+            queue.task_done()
+        assert db.inbox_state("om-mid-1") == "done"
+        assert db.inbox_state("om-mid-2") == "queued"
+        assert db.inbox_state("om-mid-3") == "queued"
+    finally:
+        blocker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await blocker
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_private_chat_append_information_uses_active_ephemeral_turn(
+    tmp_path: Path,
+) -> None:
+    config = make_config(
+        tmp_path,
+        owner_conversation_open_id="ou_conversation_owner",
+    )
+    db = BridgeDB(config.database_path)
+    codex = FakeCodex()
+    gateway = FakeGateway()
+    service = BridgeService(config, db, codex, gateway)  # type: ignore[arg-type]
+    active = ActiveTurn(
+        thread_id="thread-admin",
+        turn_id="turn-admin",
+        chat_id="oc_private",
+        app_role="conversation",
+        progress_message_id="card-admin",
+    )
+    service._register_active(active)
+
+    try:
+        queued = incoming(
+            "om-private-wait",
+            chat_id="oc_private",
+            chat_type="p2p",
+            text="私聊补充",
+            create_time_ms=1_000,
+        )
+        await service._route_incoming(stage(db, queued))
+        assert db.inbox_state("om-private-wait") == "queued"
+
+        command = incoming(
+            "om-private-append",
+            chat_id="oc_private",
+            chat_type="p2p",
+            text="追加信息",
+            create_time_ms=2_000,
+        )
+        await service._route_incoming(stage(db, command))
+
+        assert codex.steered[-1]["thread_id"] == "thread-admin"
+        assert codex.steered[-1]["turn_id"] == "turn-admin"
+        assert codex.steered[-1]["client_message_id"] == "om-private-wait"
+        assert db.inbox_state("om-private-wait") == "done"
+        assert service._admin_queue.empty()
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_private_stop_only_clears_matching_chat_queue(
+    tmp_path: Path,
+) -> None:
+    config = make_config(
+        tmp_path,
+        owner_conversation_open_id="ou_conversation_owner",
+    )
+    db = BridgeDB(config.database_path)
+    codex = FakeCodex()
+    gateway = FakeGateway()
+    service = BridgeService(config, db, codex, gateway)  # type: ignore[arg-type]
+    service._register_active(
+        ActiveTurn(
+            thread_id="thread-private-a",
+            turn_id="turn-private-a",
+            chat_id="oc_private_a",
+            app_role="conversation",
+            progress_message_id="card-private-a",
+        )
+    )
+
+    try:
+        for message_id, chat_id, created in (
+            ("om-private-a", "oc_private_a", 1_000),
+            ("om-private-b", "oc_private_b", 2_000),
+        ):
+            await service._route_incoming(
+                stage(
+                    db,
+                    incoming(
+                        message_id,
+                        chat_id=chat_id,
+                        chat_type="p2p",
+                        text=message_id,
+                        create_time_ms=created,
+                    ),
+                )
+            )
+        await service._route_incoming(
+            stage(
+                db,
+                incoming(
+                    "om-private-stop",
+                    chat_id="oc_private_a",
+                    chat_type="p2p",
+                    text="停止任务",
+                    create_time_ms=3_000,
+                ),
+            )
+        )
+
+        assert codex.interrupted == [("thread-private-a", "turn-private-a")]
+        assert db.inbox_state("om-private-a") == "cancelled"
+        assert db.inbox_state("om-private-b") == "queued"
+        assert service._admin_queue.qsize() == 1
+        retained = service._admin_queue.get_nowait()
+        assert retained.inbox.message.message_id == "om-private-b"
+        service._admin_queue.task_done()
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_deferred_stop_survives_service_recreation_and_retries_interrupt(
+    tmp_path: Path,
+) -> None:
+    config = make_config(
+        tmp_path,
+        owner_conversation_open_id="ou_conversation_owner",
+    )
+    db = BridgeDB(config.database_path)
+    gateway = FakeGateway()
+    first_service = BridgeService(
+        config,
+        db,
+        FakeCodex(),
+        gateway,
+    )  # type: ignore[arg-type]
+    bind_thread(db)
+
+    original = incoming(
+        "om-dispatching",
+        text="正在跨越启动边界",
+        create_time_ms=1_000,
+    )
+    original_item = stage(db, original)
+    db.mark_incoming_queued(original.message_id)
+    assert db.mark_incoming_dispatching(original.message_id) is True
+    job = ScheduledMessage(
+        inbox=original_item,
+        binding=db.get_binding_by_chat("oc_thread"),
+        progress_message_id="card-dispatching",
+        app_role="conversation",
+        chat_id="oc_thread",
+    )
+    first_service._thread_worker_jobs["thread-1"] = job
+    first_service._pending_jobs["thread-1"] = job
+
+    try:
+        await first_service._route_incoming(
+            stage(
+                db,
+                incoming(
+                    "om-deferred-stop",
+                    text="停止任务",
+                    create_time_ms=2_000,
+                ),
+            )
+        )
+        setting_key = first_service._deferred_stop_setting_key(
+            "conversation",
+            "oc_thread",
+        )
+        assert "om-dispatching" in (db.get_setting(setting_key, "") or "")
+
+        db.upsert_turn_job(
+            TurnJob(
+                message_id="om-dispatching",
+                thread_id="thread-1",
+                turn_id="turn-after-start",
+                app_role="conversation",
+                chat_id="oc_thread",
+                progress_message_id="card-dispatching",
+                state="accepted",
+            )
+        )
+        retrying_codex = InterruptRetryCodex(failures=1)
+        recreated = BridgeService(
+            config,
+            db,
+            retrying_codex,
+            gateway,
+        )  # type: ignore[arg-type]
+        recreated._register_active(
+            ActiveTurn(
+                thread_id="thread-1",
+                turn_id="turn-after-start",
+                chat_id="oc_thread",
+                progress_message_id="card-dispatching",
+            )
+        )
+        await asyncio.gather(*list(recreated._background_tasks))
+
+        assert retrying_codex.interrupt_attempts == 2
+        assert retrying_codex.interrupted == [
+            ("thread-1", "turn-after-start")
+        ]
+        assert db.get_setting(setting_key, "") == ""
+        assert db.list_recoverable_turn_jobs() == []
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_control_card_patch_failure_is_queued_for_durable_retry(
+    tmp_path: Path,
+) -> None:
+    class PatchFailingGateway(FakeGateway):
+        async def patch_card(
+            self,
+            role: AppRole,
+            message_id: str,
+            card: dict[str, Any],
+        ) -> None:
+            raise RuntimeError("temporary Feishu failure")
+
+    config = make_config(
+        tmp_path,
+        owner_conversation_open_id="ou_conversation_owner",
+    )
+    db = BridgeDB(config.database_path)
+    gateway = PatchFailingGateway()
+    service = BridgeService(
+        config,
+        db,
+        FakeCodex(),
+        gateway,
+    )  # type: ignore[arg-type]
+    bind_thread(db)
+    blocker = asyncio.create_task(asyncio.Event().wait())
+    service._thread_workers["thread-1"] = blocker
+
+    try:
+        await service._route_incoming(
+            stage(db, incoming("om-card-wait", text="等待", create_time_ms=1_000))
+        )
+        await service._route_incoming(
+            stage(db, incoming("om-card-stop", text="停止任务", create_time_ms=2_000))
+        )
+
+        outbox = db.claim_outbox("test-worker")
+        assert outbox is not None
+        assert outbox.msg_type == "card_patch"
+        assert outbox.content["message_id"] == "card-1"
+        assert outbox.content["card"]["header"]["title"]["content"] == "Codex 已取消"
     finally:
         blocker.cancel()
         with contextlib.suppress(asyncio.CancelledError):

@@ -528,15 +528,64 @@ class BridgeDB:
             )
             self._conn.commit()
 
-    def mark_incoming_dispatching(self, message_id: str) -> None:
+    def cancel_chat_incoming(
+        self,
+        app_role: str,
+        chat_id: str,
+        *,
+        before_or_at_ms: int,
+        exclude_message_id: str,
+        reason: str,
+    ) -> list[str]:
+        """Atomically terminalize work waiting behind a chat control command."""
+
+        now = int(time.time())
         with self._lock:
-            self._conn.execute(
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                rows = self._conn.execute(
+                    """SELECT message_id FROM inbox_messages
+                       WHERE app_role=? AND chat_id=? AND create_time_ms <= ?
+                         AND message_id != ?
+                         AND state IN ('pending', 'retry', 'processing', 'queued', 'held')
+                       ORDER BY create_time_ms, message_id""",
+                    (app_role, chat_id, before_or_at_ms, exclude_message_id),
+                ).fetchall()
+                cancelled: list[str] = []
+                for row in rows:
+                    message_id = str(row["message_id"])
+                    cur = self._conn.execute(
+                        """UPDATE inbox_messages SET state='cancelled',
+                               lease_owner=NULL, lease_until=NULL, last_error=?,
+                               updated_at=?
+                           WHERE message_id=?
+                             AND state IN ('pending', 'retry', 'processing', 'queued', 'held')""",
+                        (reason[:2000], now, message_id),
+                    )
+                    if cur.rowcount != 1:
+                        continue
+                    cancelled.append(message_id)
+                    self._conn.execute(
+                        """INSERT OR IGNORE INTO processed_messages(message_id, received_at)
+                           VALUES(?, ?)""",
+                        (message_id, now),
+                    )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        return cancelled
+
+    def mark_incoming_dispatching(self, message_id: str) -> bool:
+        with self._lock:
+            cur = self._conn.execute(
                 """UPDATE inbox_messages SET state='dispatching', lease_owner=NULL,
                    lease_until=NULL, updated_at=? WHERE message_id=?
                    AND state IN ('processing', 'queued')""",
                 (int(time.time()), message_id),
             )
             self._conn.commit()
+        return cur.rowcount == 1
 
     def mark_incoming_queued(self, message_id: str) -> None:
         """Persist that a claimed message now lives in an in-memory FIFO.
@@ -908,6 +957,30 @@ class BridgeDB:
                 (state, int(time.time()), turn_id),
             )
             self._conn.commit()
+
+    def compare_and_set_turn_job_state(
+        self,
+        turn_id: str,
+        *,
+        expected: str,
+        state: str,
+    ) -> bool:
+        with self._lock:
+            cur = self._conn.execute(
+                """UPDATE turn_jobs SET state=?, updated_at=?
+                   WHERE turn_id=? AND state=?""",
+                (state, int(time.time()), turn_id, expected),
+            )
+            self._conn.commit()
+        return cur.rowcount == 1
+
+    def turn_job_message_id(self, turn_id: str) -> str | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT message_id FROM turn_jobs WHERE turn_id=?",
+                (turn_id,),
+            ).fetchone()
+        return str(row["message_id"]) if row else None
 
     def list_recoverable_turn_jobs(self) -> list[TurnJob]:
         with self._lock:
