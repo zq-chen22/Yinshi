@@ -81,6 +81,7 @@ class BridgeConfig:
     )
     model: str | None = None
     model_reasoning_effort: str | None = None
+    new_thread_reasoning_effort: str | None = None
     service_tier: str | None = None
     approval_policy: str = "never"
     sandbox: str = "danger-full-access"
@@ -186,6 +187,11 @@ def load_config(path: str | Path | None = None) -> BridgeConfig:
         model_reasoning_effort=(
             str(bridge["model_reasoning_effort"])
             if bridge.get("model_reasoning_effort")
+            else None
+        ),
+        new_thread_reasoning_effort=(
+            str(bridge["new_thread_reasoning_effort"])
+            if bridge.get("new_thread_reasoning_effort")
             else None
         ),
         service_tier=str(bridge["service_tier"]) if bridge.get("service_tier") else None,

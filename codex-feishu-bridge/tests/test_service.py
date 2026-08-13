@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from codex_feishu_bridge.config import BridgeConfig, FeishuConfig
+from codex_feishu_bridge.config import BridgeConfig, FeishuConfig, load_config
 from codex_feishu_bridge.db import BridgeDB
 from codex_feishu_bridge.models import (
     ActiveTurn,
@@ -39,6 +39,7 @@ class FakeCodex:
         self.errors: list[tuple[str, int, str]] = []
         self.setting_updates: list[dict[str, Any]] = []
         self.started_threads: list[dict[str, Any]] = []
+        self.thread_names: list[tuple[str, str]] = []
         self.archived_threads: list[str] = []
         self.unsubscribed_threads: list[str] = []
         self.resumed_threads: list[dict[str, Any]] = []
@@ -98,6 +99,9 @@ class FakeCodex:
     async def start_thread(self, **kwargs: Any) -> dict[str, Any]:
         self.started_threads.append(kwargs)
         return {"id": f"thread-probe-{len(self.started_threads)}"}
+
+    async def set_thread_name(self, thread_id: str, name: str) -> None:
+        self.thread_names.append((thread_id, name))
 
     async def archive_thread(self, thread_id: str) -> None:
         self.archived_threads.append(thread_id)
@@ -399,6 +403,15 @@ def make_config(tmp_path: Path, **feishu_values: str) -> BridgeConfig:
     )
     config.prepare_dirs()
     return config
+
+
+def test_loads_new_thread_reasoning_effort(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        '[bridge]\nnew_thread_reasoning_effort = "max"\n', encoding="utf-8"
+    )
+
+    assert load_config(config_path).new_thread_reasoning_effort == "max"
 
 
 def incoming(
@@ -2204,6 +2217,40 @@ async def test_global_runtime_defaults_cover_new_scopes_and_can_be_overridden(
             stage(db, incoming("default-effort-off", text="/model gpt-test default"))
         )
         assert service._runtime_settings("thread-1").effort is None
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_new_conversation_snapshots_new_thread_effort_only(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
+    config.model = "gpt-test"
+    config.model_reasoning_effort = "high"
+    config.new_thread_reasoning_effort = "max"
+    db = BridgeDB(config.database_path)
+    codex = FakeCodex()
+    codex.models[0]["supportedReasoningEfforts"].append(
+        {"reasoningEffort": "max"}
+    )
+    service = BridgeService(config, db, codex, FakeGateway())  # type: ignore[arg-type]
+
+    try:
+        binding = await service.create_new_conversation("新对话", tmp_path)
+
+        assert binding.thread_id == "thread-probe-1"
+        assert db.get_setting("runtime:thread-probe-1:effort") == "max"
+        assert service._runtime_settings("thread-probe-1").effort == "max"
+        assert service._runtime_settings("older-thread").effort == "high"
+        assert codex.thread_names == [("thread-probe-1", "新对话")]
+        assert codex.setting_updates[-1]["thread_id"] == "thread-probe-1"
+        assert codex.setting_updates[-1]["effort"] == "max"
+        reopened = BridgeDB(config.database_path)
+        try:
+            assert reopened.get_setting("runtime:thread-probe-1:effort") == "max"
+        finally:
+            reopened.close()
     finally:
         db.close()
 

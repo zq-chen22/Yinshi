@@ -46,6 +46,8 @@ group_suffix = "-你的机器名称"
 # 不填写 model/effort/service_tier 时继承该机器上的 Codex 默认值。
 # model = "你的 Codex model id"
 # model_reasoning_effort = "high"
+# 只在创建新对话时快照为该对话的独立默认值；不会追溯修改旧对话。
+# new_thread_reasoning_effort = "max"
 # service_tier = "priority"
 approval_policy = "on-request"
 sandbox = "workspace-write"

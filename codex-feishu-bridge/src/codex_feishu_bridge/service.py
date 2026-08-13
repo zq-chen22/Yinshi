@@ -335,6 +335,17 @@ class BridgeService:
             source_kind="appServer",
         )
         binding = self.db.upsert_thread(summary, title=clean_title)
+        if self.config.new_thread_reasoning_effort:
+            # Snapshot the creation default into the thread scope.  A later
+            # change to the bridge-wide fallback must not silently rewrite
+            # existing conversations.
+            self.db.set_runtime_config(
+                thread_id,
+                "effort",
+                self.config.new_thread_reasoning_effort,
+                message_id=inbox_message_id or f"new-thread:{thread_id}",
+            )
+            await self._apply_runtime_if_idle(binding, thread_id)
         owner = self._owner("conversation")
         if self.gateway.configured("conversation") and owner:
             await self._create_binding_chat(binding, owner)
@@ -2186,6 +2197,15 @@ class BridgeService:
                 f"默认推理强度 {self.config.model_reasoning_effort!r} "
                 f"不受模型 {self.config.model!r} 支持"
             )
+        if (
+            selected
+            and self.config.new_thread_reasoning_effort
+            and self.config.new_thread_reasoning_effort not in _model_efforts(selected)
+        ):
+            raise ValueError(
+                f"新对话默认推理强度 {self.config.new_thread_reasoning_effort!r} "
+                f"不受模型 {self.config.model!r} 支持"
+            )
         if selected and self.config.service_tier and self.config.service_tier not in {
             str(tier.get("id") or "") for tier in selected.get("serviceTiers") or []
         }:
@@ -2212,7 +2232,10 @@ class BridgeService:
                 approval_policy=self.config.approval_policy,
                 sandbox=self.config.sandbox,
                 model=self.config.model,
-                effort=self.config.model_reasoning_effort,
+                effort=(
+                    self.config.new_thread_reasoning_effort
+                    or self.config.model_reasoning_effort
+                ),
                 service_tier=self.config.service_tier,
             )
         finally:
