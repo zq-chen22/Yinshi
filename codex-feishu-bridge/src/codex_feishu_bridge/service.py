@@ -1106,11 +1106,17 @@ class BridgeService:
             or ""
         )
         if anchor_union or anchor_user:
-            if not (
-                (anchor_union and message.sender_union_id == anchor_union)
-                or (anchor_user and message.sender_user_id == anchor_user)
-            ):
-                return False
+            if message.sender_union_id or message.sender_user_id:
+                if not (
+                    (anchor_union and message.sender_union_id == anchor_union)
+                    or (anchor_user and message.sender_user_id == anchor_user)
+                ):
+                    return False
+            # Feishu's chat-history API normally returns only the app-scoped
+            # open_id.  At this point both that open_id and the paired tenant
+            # have already matched, so a missing cross-app identity is an API
+            # omission rather than evidence of a different sender.  Keep
+            # rejecting an explicitly conflicting user_id/union_id above.
         elif message.sender_union_id or message.sender_user_id:
             if message.sender_union_id:
                 self.db.set_setting("paired_owner_union_id", message.sender_union_id)

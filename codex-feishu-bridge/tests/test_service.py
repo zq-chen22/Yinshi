@@ -759,6 +759,36 @@ async def test_unauthorized_sender_is_completed_without_reply_or_codex_dispatch(
         db.close()
 
 
+def test_history_sender_without_cross_app_ids_uses_paired_open_id_and_tenant(
+    tmp_path: Path,
+) -> None:
+    config = make_config(
+        tmp_path,
+        owner_conversation_open_id="ou_conversation_owner",
+    )
+    db = BridgeDB(config.database_path)
+    service = BridgeService(config, db, FakeCodex(), FakeGateway())  # type: ignore[arg-type]
+    db.set_setting("paired_tenant_key", "tenant-yinshi")
+    db.set_setting("paired_owner_union_id", "on_same_human")
+
+    try:
+        recovered = incoming("om-history-owner")
+        recovered.sender_user_id = None
+        recovered.sender_union_id = None
+        assert service._authorized(recovered) is True
+
+        conflicting = incoming("om-history-conflict")
+        conflicting.sender_union_id = "on_someone_else"
+        assert service._authorized(conflicting) is False
+
+        wrong_open_id = incoming("om-history-wrong-open", open_id="ou_someone_else")
+        wrong_open_id.sender_user_id = None
+        wrong_open_id.sender_union_id = None
+        assert service._authorized(wrong_open_id) is False
+    finally:
+        db.close()
+
+
 @pytest.mark.asyncio
 async def test_same_thread_messages_are_fifo_and_steer_targets_the_active_turn(
     tmp_path: Path,
