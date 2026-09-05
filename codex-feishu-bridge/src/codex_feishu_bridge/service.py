@@ -38,7 +38,9 @@ from .visual_proxy import build_codex_hook_config
 
 
 LOG = logging.getLogger(__name__)
-SUPPORTED_SETTINGS_CLI_VERSION = "0.144.1"
+# Bump only after model/list and the thread settings protocol have both passed
+# the live compatibility probe against the released CLI.
+SUPPORTED_SETTINGS_CLI_VERSION = "0.153.4"
 RUNTIME_MODEL_DEFAULT = "__model_default__"
 RUNTIME_SERVICE_TIER_OFF = "__off__"
 PAIR_RE = re.compile(r"^(?:配对|pair)\s+([A-Z2-9-]{8,20})$", re.IGNORECASE)
@@ -560,9 +562,8 @@ class BridgeService:
 
     async def _recover_turn_jobs(self, *, startup: bool = False) -> None:
         for job in self.db.list_recoverable_turn_jobs():
-            known_active = self._active_by_turn.get(job.turn_id)
             age = max(0, int(time.time()) - job.created_at) if job.created_at else 0
-            active = known_active or ActiveTurn(
+            candidate = ActiveTurn(
                 thread_id=job.thread_id,
                 turn_id=job.turn_id,
                 chat_id=job.chat_id,
@@ -572,6 +573,17 @@ class BridgeService:
             )
             try:
                 turn = await self._find_turn_summary(job.thread_id, job.turn_id)
+                # ``_find_turn_summary`` yields to the notification consumer.
+                # A live completion may therefore finalize this exact turn
+                # while the recovery query is in flight.  Never use an
+                # active-map snapshot taken before that await: doing so can
+                # re-register a completed turn with an already-set done Event.
+                done = self._turn_done.get(job.turn_id)
+                if job.turn_id in self._completed_turns or (
+                    done is not None and done.is_set()
+                ):
+                    continue
+                active = self._active_by_turn.get(job.turn_id) or candidate
                 if turn and turn.get("status") in {"completed", "failed", "interrupted"}:
                     commentary_messages, final_messages = extract_agent_messages(turn)
                     if (
@@ -581,15 +593,19 @@ class BridgeService:
                     ):
                         await self._continue_interrupted_turn(job)
                         continue
-                    if known_active is None:
+                    if self._active_by_turn.get(job.turn_id) is None:
                         self._register_active(active)
+                        registered = self._active_by_turn.get(job.turn_id)
+                        if registered is None:
+                            continue
+                        active = registered
                     await self._finalize_turn(active, turn)
-                elif known_active is None:
+                elif self._active_by_turn.get(job.turn_id) is None:
                     await self._mark_lost_turn(active)
             except Exception:
                 LOG.exception("Could not recover persisted turn job %s", job.turn_id)
-                if known_active is None:
-                    await self._mark_lost_turn(active)
+                if self._active_by_turn.get(job.turn_id) is None:
+                    await self._mark_lost_turn(candidate)
 
     async def _continue_interrupted_turn(self, job: TurnJob) -> None:
         """Continue bridge-owned work interrupted by an App Server restart.
@@ -751,7 +767,10 @@ class BridgeService:
             turn_id=active.turn_id,
         )
         self._active_by_turn.pop(active.turn_id, None)
-        if self._active_by_thread.get(active.thread_id) is active:
+        indexed = self._active_by_thread.get(active.thread_id)
+        if indexed is active or (
+            indexed is not None and indexed.turn_id == active.turn_id
+        ):
             self._active_by_thread.pop(active.thread_id, None)
 
     async def _receiver_watch_loop(self) -> None:
@@ -2422,7 +2441,25 @@ class BridgeService:
         if self.db.inbox_state(message.message_id) not in {"processing", "queued"}:
             return
         while active := self._active_by_thread.get(thread_id):
-            await self._turn_done.setdefault(active.turn_id, asyncio.Event()).wait()
+            done = self._turn_done.setdefault(active.turn_id, asyncio.Event())
+            if done.is_set() or active.turn_id in self._completed_turns:
+                # A terminal notification normally removes both active indexes
+                # in ``_finalize_turn``.  Keep this boundary defensive: if a
+                # late/racing notification leaves a completed ActiveTurn in
+                # the thread index, awaiting its already-set Event returns
+                # immediately and this loop otherwise becomes a CPU spin that
+                # starves every bridge worker.
+                LOG.warning(
+                    "Discarding completed active-turn residue %s for thread %s",
+                    active.turn_id,
+                    thread_id,
+                )
+                if self._active_by_turn.get(active.turn_id) is active:
+                    self._active_by_turn.pop(active.turn_id, None)
+                if self._active_by_thread.get(thread_id) is active:
+                    self._active_by_thread.pop(thread_id, None)
+                continue
+            await done.wait()
         if self.db.inbox_state(message.message_id) not in {"processing", "queued"}:
             return
         if not await self._wait_thread_available(thread_id, job):
@@ -3073,6 +3110,12 @@ class BridgeService:
             return
         active = self._active_by_turn.get(turn_id) if turn_id else None
         if method == "turn/started":
+            done = self._turn_done.get(turn_id)
+            if turn_id in self._completed_turns or (
+                done is not None and done.is_set()
+            ):
+                LOG.warning("Ignoring late turn/started for completed turn %s", turn_id)
+                return
             if not active:
                 job = self._pending_jobs.get(thread_id)
                 if job:
@@ -3316,7 +3359,10 @@ class BridgeService:
                     turn_id=active.turn_id,
                 )
                 self._active_by_turn.pop(active.turn_id, None)
-                if self._active_by_thread.get(active.thread_id) is active:
+                indexed = self._active_by_thread.get(active.thread_id)
+                if indexed is active or (
+                    indexed is not None and indexed.turn_id == active.turn_id
+                ):
                     self._active_by_thread.pop(active.thread_id, None)
                 if active.progress_message_id:
                     self._terminal_progress_messages.discard(
@@ -3673,6 +3719,17 @@ class BridgeService:
             )
 
     def _register_active(self, active: ActiveTurn) -> None:
+        done = self._turn_done.setdefault(active.turn_id, asyncio.Event())
+        if active.turn_id in self._completed_turns or done.is_set():
+            LOG.warning(
+                "Ignoring late active-turn registration for completed turn %s",
+                active.turn_id,
+            )
+            self._active_by_turn.pop(active.turn_id, None)
+            indexed = self._active_by_thread.get(active.thread_id)
+            if indexed is not None and indexed.turn_id == active.turn_id:
+                self._active_by_thread.pop(active.thread_id, None)
+            return
         if not active.started_monotonic:
             active.started_monotonic = time.monotonic()
         if not active.last_event_monotonic:
@@ -3681,7 +3738,6 @@ class BridgeService:
             active.last_event_name = "turn/started"
         self._active_by_thread[active.thread_id] = active
         self._active_by_turn[active.turn_id] = active
-        self._turn_done.setdefault(active.turn_id, asyncio.Event())
         pending = self._pending_jobs.get(active.thread_id)
         message_id = (
             pending.inbox.message.message_id

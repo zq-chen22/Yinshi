@@ -24,6 +24,7 @@ from codex_feishu_bridge.service import (
     BridgeService,
     RuntimeSettings,
     ScheduledMessage,
+    SUPPORTED_SETTINGS_CLI_VERSION,
     generate_pairing_code,
 )
 
@@ -567,6 +568,129 @@ async def test_completed_before_turn_start_response_leaves_no_ghost_active(tmp_p
         assert db.outbox_counts() == {"pending": 1}
         assert db.list_recoverable_turn_jobs() == []
     finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_execute_job_discards_completed_active_residue_without_spinning(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path, owner_conversation_open_id="ou_conversation_owner")
+    db = BridgeDB(config.database_path)
+    codex = FastCompletingCodex()
+    gateway = FakeGateway()
+    service = BridgeService(config, db, codex, gateway)  # type: ignore[arg-type]
+    bind_thread(db)
+    message = incoming("om-after-ghost", text="继续下一项任务")
+    item = stage(db, message)
+    db.mark_incoming_queued(message.message_id)
+    job = ScheduledMessage(
+        inbox=item,
+        binding=db.get_binding_by_thread("thread-1"),
+        progress_message_id="progress-after-ghost",
+        app_role="conversation",
+        chat_id="oc_thread",
+    )
+    residue = ActiveTurn(
+        thread_id="thread-1",
+        turn_id="turn-completed-residue",
+        chat_id="oc_thread",
+        progress_message_id="progress-old",
+    )
+    service._register_active(residue)
+    service._turn_done[residue.turn_id].set()
+    try:
+        await asyncio.wait_for(service._execute_job("thread-1", job), timeout=1)
+        assert residue.turn_id not in service._active_by_turn
+        assert service._active_by_thread == {}
+        assert db.inbox_state(message.message_id) == "done"
+        assert db.outbox_counts() == {"pending": 1}
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_recovery_query_cannot_reregister_turn_completed_while_awaiting(
+    tmp_path: Path,
+) -> None:
+    class RacingRecoveryCodex(FakeCodex):
+        def __init__(self) -> None:
+            super().__init__()
+            self.query_started = asyncio.Event()
+            self.release_query = asyncio.Event()
+
+        async def list_turns(self, thread_id: str, **_: Any) -> dict[str, Any]:
+            self.query_started.set()
+            await self.release_query.wait()
+            return {
+                "data": [
+                    {
+                        "id": "turn-recovery-race",
+                        "status": "completed",
+                        "items": [
+                            {
+                                "type": "agentMessage",
+                                "phase": "final_answer",
+                                "text": "竞态期间已经完成",
+                            }
+                        ],
+                    }
+                ],
+                "nextCursor": None,
+            }
+
+    config = make_config(tmp_path, owner_conversation_open_id="ou_conversation_owner")
+    db = BridgeDB(config.database_path)
+    codex = RacingRecoveryCodex()
+    service = BridgeService(config, db, codex, FakeGateway())  # type: ignore[arg-type]
+    job = TurnJob(
+        message_id="om-recovery-race",
+        thread_id="thread-recovery-race",
+        turn_id="turn-recovery-race",
+        app_role="conversation",
+        chat_id="oc_thread",
+        progress_message_id="progress-recovery-race",
+        state="accepted",
+    )
+    db.upsert_turn_job(job)
+    recovery = asyncio.create_task(service._recover_turn_jobs())
+    try:
+        await asyncio.wait_for(codex.query_started.wait(), timeout=1)
+        live = ActiveTurn(
+            thread_id=job.thread_id,
+            turn_id=job.turn_id,
+            chat_id=job.chat_id,
+            progress_message_id=job.progress_message_id,
+        )
+        service._register_active(live)
+        await service._finalize_turn(
+            live,
+            {
+                "id": job.turn_id,
+                "status": "completed",
+                "items": [
+                    {
+                        "type": "agentMessage",
+                        "phase": "final_answer",
+                        "text": "竞态期间已经完成",
+                    }
+                ],
+            },
+        )
+        assert service._active_by_thread == {}
+        assert service._turn_done[job.turn_id].is_set()
+
+        codex.release_query.set()
+        await asyncio.wait_for(recovery, timeout=1)
+        assert service._active_by_thread == {}
+        assert service._active_by_turn == {}
+        assert db.list_recoverable_turn_jobs() == []
+    finally:
+        codex.release_query.set()
+        if not recovery.done():
+            recovery.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await recovery
         db.close()
 
 
@@ -2107,6 +2231,25 @@ async def test_cli_version_change_fails_closed_for_slash_settings(tmp_path: Path
         assert service._runtime_settings("thread-1").service_tier is None
         assert "兼容门禁已触发" in gateway.texts[-1]["text"]
         assert "9.9.9" in gateway.texts[-1]["text"]
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_supported_cli_baseline_keeps_runtime_settings_enabled(tmp_path: Path) -> None:
+    config = make_config(tmp_path, owner_conversation_open_id="ou_conversation_owner")
+    db = BridgeDB(config.database_path)
+    codex = FakeCodex()
+    codex.cli_version = SUPPORTED_SETTINGS_CLI_VERSION
+    gateway = FakeGateway(configured_roles={"conversation"})
+    service = BridgeService(config, db, codex, gateway)  # type: ignore[arg-type]
+
+    try:
+        await service._probe_runtime_settings_compatibility()
+
+        assert service._runtime_compatibility_error is None
+        assert db.get_setting("codex_settings_compatibility") == "ok"
+        assert gateway.cards == []
     finally:
         db.close()
 
