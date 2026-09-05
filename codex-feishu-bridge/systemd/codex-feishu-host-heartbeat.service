@@ -1,0 +1,25 @@
+[Unit]
+Description=Report that the Codex Feishu host is reachable
+Documentation=file://@PROJECT_ROOT@/../docs/11-host-heartbeat-monitoring.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=@USER@
+Group=@GROUP@
+WorkingDirectory=@PROJECT_ROOT@
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=@HEARTBEAT_ENV@
+ExecStart="@PROJECT_ROOT@/.venv/bin/python" -m codex_feishu_bridge.heartbeat host
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+UMask=0077

@@ -1,0 +1,19 @@
+[Unit]
+Description=Report the Codex Feishu Bridge user service health
+Documentation=file://@PROJECT_ROOT@/../docs/11-host-heartbeat-monitoring.md
+After=codex-feishu-bridge.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=@PROJECT_ROOT@
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=@HEARTBEAT_ENV@
+ExecStart="@PROJECT_ROOT@/.venv/bin/python" -m codex_feishu_bridge.heartbeat bridge
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateDevices=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+UMask=0077
