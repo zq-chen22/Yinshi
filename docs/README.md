@@ -24,6 +24,7 @@
 2. [故障排查](09-troubleshooting.md)
 3. [图像任务性能与上下文治理](10-image-performance.md)
 4. [主机与飞书桥外部心跳监控](11-host-heartbeat-monitoring.md)
+5. [多主机统一发布与无损迁移](12-fleet-releases.md)
 5. [开发与未来开源](08-development-and-open-source.md)
 
 ## 文档清单

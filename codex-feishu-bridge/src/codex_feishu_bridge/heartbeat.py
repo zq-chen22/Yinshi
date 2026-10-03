@@ -10,7 +10,6 @@ from collections.abc import Callable, Mapping
 from urllib.parse import SplitResult, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
-
 TARGET_ENV = {
     "host": "HEALTHCHECKS_HOST_PING_URL",
     "bridge": "HEALTHCHECKS_BRIDGE_PING_URL",
@@ -93,8 +92,6 @@ def send_ping(value: str, *, timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS) -
                 raw_status = response.getcode()
             status = int(raw_status)
     except Exception as error:
-        # urllib exceptions often include the full URL.  Never propagate their
-        # text because a Healthchecks ping URL is itself a credential.
         raise HeartbeatError(
             f"heartbeat 请求失败（{type(error).__name__}）"
         ) from None
@@ -110,13 +107,7 @@ def heartbeat_once(
     unit_checker: Callable[[str], bool] = bridge_unit_active,
     sender: Callable[[str], None] = send_ping,
 ) -> str:
-    """Send one heartbeat and return ``up`` or ``down``.
-
-    A bridge probe explicitly reports ``/fail`` when the systemd user service
-    is known to be inactive.  When the entire user session or host disappears,
-    no request is emitted and the managed monitor reaches the same state by
-    timeout.
-    """
+    """Send one heartbeat and return ``up`` or ``down``."""
 
     if target not in TARGET_ENV:
         raise HeartbeatError(f"未知 heartbeat target：{target}")

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-import copy
 import contextlib
+import copy
 import json
 import logging
 import os
@@ -12,7 +12,8 @@ from pathlib import Path
 from typing import Any
 
 from .models import ThreadSummary
-
+from . import __version__
+from .privacy import log_ref, redact_log
 
 LOG = logging.getLogger(__name__)
 # A single image-generation completion notification can legitimately contain
@@ -74,7 +75,7 @@ class CodexAppServer:
         self.initialize_result: Message = {}
         self.cli_version: str | None = None
 
-    async def __aenter__(self) -> "CodexAppServer":
+    async def __aenter__(self) -> CodexAppServer:
         await self.start()
         return self
 
@@ -87,9 +88,7 @@ class CodexAppServer:
     def set_server_request_handler(self, handler: ServerRequestHandler) -> None:
         self._server_request_handler = handler
 
-    def configure_thread_defaults(
-        self, *, config_overrides: dict[str, Any] | None = None
-    ) -> None:
+    def configure_thread_defaults(self, *, config_overrides: dict[str, Any] | None = None) -> None:
         """Apply bridge-owned config to every subsequent start and resume."""
 
         self._thread_config_overrides = copy.deepcopy(config_overrides or {})
@@ -129,7 +128,7 @@ class CodexAppServer:
                 "clientInfo": {
                     "name": "codex_feishu_bridge",
                     "title": "Codex Feishu Bridge",
-                    "version": "0.1.0",
+                    "version": __version__,
                 },
                 "capabilities": {
                     "experimentalApi": True,
@@ -210,18 +209,14 @@ class CodexAppServer:
             payload["params"] = params
         await self._send(payload)
 
-    async def respond_server_request(
-        self, rpc_id: str | int, result: dict[str, Any]
-    ) -> None:
+    async def respond_server_request(self, rpc_id: str | int, result: dict[str, Any]) -> None:
         key = str(rpc_id)
         if key not in self._server_requests:
             raise KeyError(f"Codex server request {key} is no longer pending")
         await self._send({"id": int(key) if key.isdigit() else key, "result": result})
         self._server_requests.pop(key, None)
 
-    async def respond_server_error(
-        self, rpc_id: str | int, code: int, message: str
-    ) -> None:
+    async def respond_server_error(self, rpc_id: str | int, code: int, message: str) -> None:
         key = str(rpc_id)
         if key not in self._server_requests:
             return
@@ -508,13 +503,19 @@ class CodexAppServer:
             await proc.stdin.drain()
 
     async def _read_stdout(self) -> None:
-        assert self.process and self.process.stdout
+        process = self.process
+        if process is None or process.stdout is None:
+            raise RuntimeError("Codex app-server stdout is unavailable")
         try:
-            while line := await self.process.stdout.readline():
+            while line := await process.stdout.readline():
                 try:
                     message: Message = json.loads(line)
                 except json.JSONDecodeError:
-                    LOG.warning("Ignoring malformed app-server line: %r", line[:500])
+                    LOG.warning(
+                        "Ignoring malformed app-server line bytes=%d ref=%s",
+                        len(line),
+                        log_ref(line.decode(errors="replace")),
+                    )
                     continue
                 request_id = message.get("id")
                 method = message.get("method")
@@ -535,7 +536,10 @@ class CodexAppServer:
                         if not future.done():
                             future.set_result(message)
                     else:
-                        LOG.debug("Unmatched app-server response id=%s", request_id)
+                        LOG.debug(
+                            "Unmatched app-server response ref=%s",
+                            log_ref(str(request_id)),
+                        )
                     continue
                 if method:
                     # stdout is the protocol's only ordering boundary. Keep
@@ -564,18 +568,21 @@ class CodexAppServer:
             self._closed.set()
 
     async def _read_stderr(self) -> None:
-        assert self.process and self.process.stderr
+        process = self.process
+        if process is None or process.stderr is None:
+            raise RuntimeError("Codex app-server stderr is unavailable")
         try:
-            while line := await self.process.stderr.readline():
+            while line := await process.stderr.readline():
                 text = line.decode(errors="replace").rstrip()
                 if text:
-                    LOG.warning("codex app-server: %s", text)
+                    LOG.warning("codex app-server: %s", redact_log(text))
         except asyncio.CancelledError:
             raise
 
     async def _dispatch_notifications(self) -> None:
         queue = self._notification_queue
-        assert queue is not None
+        if queue is None:
+            raise RuntimeError("Codex notification queue is unavailable")
         try:
             while True:
                 message = await queue.get()
@@ -629,9 +636,11 @@ class CodexAppServer:
         return message
 
     async def _dispatch_server_request(self, message: Message) -> None:
-        assert self._server_request_handler is not None
+        handler = self._server_request_handler
+        if handler is None:
+            raise RuntimeError("Codex server request handler is unavailable")
         try:
-            await self._server_request_handler(message)
+            await handler(message)
         except Exception as error:
             LOG.exception("Codex server request handler failed")
             with contextlib.suppress(Exception):
@@ -712,6 +721,32 @@ def extract_agent_messages(turn: Message) -> tuple[list[str], list[str]]:
         else:
             commentary.append(text)
     return commentary, final
+
+
+def extract_user_messages(turn: Message) -> list[str]:
+    messages: list[str] = []
+    for item in turn.get("items") or []:
+        if item.get("type") != "userMessage":
+            continue
+        parts: list[str] = []
+        content = item.get("content")
+        if isinstance(content, str):
+            parts.append(content)
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, str):
+                    parts.append(part)
+                elif isinstance(part, dict):
+                    text = part.get("text")
+                    if isinstance(text, str):
+                        parts.append(text)
+        direct_text = item.get("text")
+        if not parts and isinstance(direct_text, str):
+            parts.append(direct_text)
+        message = "\n".join(part.strip() for part in parts if part.strip()).strip()
+        if message:
+            messages.append(message)
+    return messages
 
 
 def latest_final_from_thread(thread: Message) -> tuple[str | None, str]:

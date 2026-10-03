@@ -7,34 +7,34 @@ import logging
 import os
 import shutil
 import signal
-import subprocess
+import stat
+
+# The doctor command below uses a fixed absolute executable and fixed argv only.
+import subprocess  # nosec B404
 import sys
+from importlib import resources
 from pathlib import Path
 
 import httpx
 
+from . import __version__
 from .codex_client import CodexAppServer
 from .config import DEFAULT_CONFIG_DIR, BridgeConfig, load_config
 from .daily_stats import DailyStatsError, column_name, sync_daily_stats
 from .db import BridgeDB
 from .feishu import FeishuGateway
 from .models import ThreadSummary
+from .privacy import redact_log
 from .service import BridgeService, generate_pairing_code
-
 
 LOG = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEPLOYMENT_INITIAL_THREADS = {
-    "019f5563-9e7c-7603-82ef-5b0ca2170fd8": "飞书监督与操控 Codex",
-    "019f1c76-e474-7471-816a-971c3944ca66": "Codex 账户与环境检查",
-    "019ed59b-147a-7be2-9aa6-e0c27b613881": "创建触觉读取记录",
-}
 
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
         prog="codex-feishu-bridge",
-        description="用因时飞书组织监督和操控本机 Codex 对话",
+        description="通过飞书安全协调本机 Codex 对话",
     )
     result.add_argument(
         "--config",
@@ -42,6 +42,7 @@ def parser() -> argparse.ArgumentParser:
         default=DEFAULT_CONFIG_DIR / "config.toml",
         help="配置文件路径（默认：%(default)s）",
     )
+    result.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     result.add_argument("--verbose", action="store_true", help="输出调试日志（不会输出 Secret）")
     commands = result.add_subparsers(dest="command", required=True)
     commands.add_parser("init", help="创建本地配置目录并登记最近 3 个 Codex 对话")
@@ -50,21 +51,30 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser("pair-code", help="生成 15 分钟有效的 Codex 机器人配对码")
     commands.add_parser("bootstrap", help="凭据和配对就绪后创建待绑定的飞书对话群")
     commands.add_parser("run", help="以前台常驻方式运行长连接、执行和同步服务")
-    commands.add_parser("sync-daily-stats", help="同步今天和昨天的飞书触发 Codex 任务统计")
+    commands.add_parser("sync-daily-stats", help="同步每日任务和 Codex 周额度统计")
     return result
 
 
 def main(argv: list[str] | None = None) -> None:
     args = parser().parse_args(argv)
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    _configure_logging(args.verbose)
     try:
         code = asyncio.run(_main(args))
     except KeyboardInterrupt:
         code = 130
     raise SystemExit(code)
+
+
+def _configure_logging(verbose: bool) -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    logging.getLogger("codex_feishu_bridge").setLevel(logging.DEBUG if verbose else logging.INFO)
+    # A global DEBUG level can make HTTP/WebSocket SDKs emit request internals.
+    # Verbose mode is intentionally limited to bridge-owned, redacted loggers.
+    for logger_name in ("httpx", "httpcore", "lark_oapi", "websockets"):
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
 
 
 async def _main(args: argparse.Namespace) -> int:
@@ -82,8 +92,11 @@ async def _main(args: argparse.Namespace) -> int:
         if args.command == "pair-code":
             code, expires = generate_pairing_code(db, config.feishu.pairing_code_ttl_seconds)
             print(f"配对码：{code}")
-            print(f"有效期至 Unix 时间 {expires}（约 {config.feishu.pairing_code_ttl_seconds // 60} 分钟）。")
-            print("请只在因时组织中，私聊 Codex 机器人发送：")
+            print(
+                "有效期至 Unix 时间 "
+                f"{expires}（约 {config.feishu.pairing_code_ttl_seconds // 60} 分钟）。"
+            )
+            print("请只在你自己的飞书租户中，私聊 Codex 机器人发送：")
             print(f"  配对 {code}")
             print("不要把 App Secret 粘贴到任何聊天中。")
             return 0
@@ -106,11 +119,23 @@ async def _sync_daily_stats(config: BridgeConfig, db: BridgeDB) -> int:
         return 1
     left = column_name(result.column_start_index)
     right = column_name(result.column_start_index + 1)
+    quota_left = column_name(result.quota_column_start_index)
+    quota_right = column_name(result.quota_column_start_index + 1)
+    summary_left = column_name(result.summary_column_start_index)
+    summary_right = column_name(result.summary_column_start_index + 1)
     print(f"主机：{result.identity.hostname}（{result.identity.host_id}）")
     print(f"机器人：{result.identity.bot_name}")
-    print(f"工作表：{result.sheet_title}；列组：{left}:{right}")
+    print(
+        f"工作表：{result.sheet_title}；任务列：{left}:{right}；额度列：{quota_left}:{quota_right}；"
+        f"汇总列：{summary_left}:{summary_right}（{result.summary_row_count} 个日期）"
+    )
     for count in result.counts:
-        print(f"{count.day.isoformat()}：总任务 {count.total}，长任务 {count.long}")
+        quota = next((item for item in result.quota_cells if item[0] == count.day), None)
+        remaining, used = (quota[1], quota[2]) if quota else ("", "")
+        print(
+            f"{count.day.isoformat()}：总任务 {count.total}，长任务 {count.long}，"
+            f"剩余周额度 {remaining or '—'}，当日观测用量 {used or '—'}"
+        )
     print("验证：读取成功；写入并回读成功；其他机器人列和历史数据保持不变。")
     return 0
 
@@ -128,16 +153,6 @@ async def _init(config: BridgeConfig, db: BridgeDB) -> int:
         initial = threads[: config.initial_thread_count]
         for thread in initial:
             db.upsert_thread(thread, title=_suggest_title(thread))
-        # This installation was requested while these three threads were the
-        # initial recent set.  If another local task became recent during
-        # setup, retain the original three and also let the rolling watcher add
-        # the newcomer; old bindings are intentionally never deleted.
-        by_id = {thread.thread_id: thread for thread in threads}
-        for thread_id, title in DEPLOYMENT_INITIAL_THREADS.items():
-            thread = by_id.get(thread_id)
-            if thread:
-                db.upsert_thread(thread, title=title)
-                db.set_binding_title(thread_id, title)
     except Exception as error:
         print(f"初始化目录完成，但读取 Codex 对话失败：{error}", file=sys.stderr)
         return 1
@@ -210,7 +225,7 @@ async def _run(config: BridgeConfig, db: BridgeDB) -> int:
             loop.add_signal_handler(sig, stop_event.set)
     try:
         await service.start()
-        print("Codex 飞书桥已运行；按 Ctrl+C 停止。", flush=True)
+        print("飞行桥已运行；按 Ctrl+C 停止。", flush=True)
         manual_stop = asyncio.create_task(stop_event.wait())
         service_stop = asyncio.create_task(service.wait_stopped())
         done, pending = await asyncio.wait(
@@ -222,13 +237,14 @@ async def _run(config: BridgeConfig, db: BridgeDB) -> int:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
         if service_stop in done and service.fatal_error:
-            LOG.error("Bridge stopped because a critical worker failed: %s", service.fatal_error)
+            LOG.error(
+                "Bridge stopped because a critical worker failed: %s",
+                redact_log(service.fatal_error),
+            )
             return_code = 1
         else:
             print("Codex 飞书桥正在排空已接单任务；新消息会由重启后的服务处理。", flush=True)
-            drained = await service.wait_for_drain(
-                config.shutdown_drain_timeout_seconds
-            )
+            drained = await service.wait_for_drain(config.shutdown_drain_timeout_seconds)
             if drained:
                 print("已接单任务及结果已排空，可以安全重启。", flush=True)
                 return_code = 0
@@ -252,8 +268,20 @@ async def _doctor(config: BridgeConfig, db: BridgeDB) -> int:
 
     if config.config_path.exists():
         add("OK", "配置文件", str(config.config_path))
+        mode = stat.S_IMODE(config.config_path.stat().st_mode)
+        if mode & 0o077:
+            add("WARN", "配置权限", f"当前为 {mode:04o}；建议 chmod 600")
+        else:
+            add("OK", "配置权限", f"{mode:04o}")
     else:
         add("FAIL", "配置文件", "不存在；先运行 init")
+    secret_path = config.config_path.parent / "secrets.env"
+    if secret_path.exists():
+        mode = stat.S_IMODE(secret_path.stat().st_mode)
+        if mode & 0o077:
+            add("FAIL", "Secret 文件权限", f"当前为 {mode:04o}；请执行 chmod 600")
+        else:
+            add("OK", "Secret 文件权限", f"{mode:04o}")
     codex_path = shutil.which(config.codex_bin)
     if codex_path:
         add("OK", "Codex CLI", codex_path)
@@ -263,7 +291,7 @@ async def _doctor(config: BridgeConfig, db: BridgeDB) -> int:
             threads = await codex.list_threads(limit=3, source_kinds=config.source_kinds)
             add("OK", "Codex App Server", f"可读取 {len(threads)} 个最近对话")
         except Exception as error:
-            add("FAIL", "Codex App Server", str(error))
+            add("FAIL", "Codex App Server", redact_log(error))
         finally:
             await codex.close()
     else:
@@ -279,8 +307,7 @@ async def _doctor(config: BridgeConfig, db: BridgeDB) -> int:
         add("OK" if ok else "FAIL", "飞书 Codex 凭据", detail)
 
     owner = (
-        db.get_setting("owner_open_id:conversation", "")
-        or config.feishu.owner_conversation_open_id
+        db.get_setting("owner_open_id:conversation", "") or config.feishu.owner_conversation_open_id
     )
     add("OK" if owner else "WARN", "Codex owner", "已配对" if owner else "尚未配对")
 
@@ -300,12 +327,15 @@ async def _doctor(config: BridgeConfig, db: BridgeDB) -> int:
         # is a non-privileged, side-effect-free way to confirm the profile is
         # actually loaded.
         with contextlib.suppress(OSError):
-            loaded = subprocess.run(
-                ["aa-exec", "-p", "bwrap", "--", "/usr/bin/true"],
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            ).returncode == 0
+            loaded = (
+                subprocess.run(  # nosec B603
+                    ["/usr/bin/aa-exec", "-p", "bwrap", "--", "/usr/bin/true"],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                ).returncode
+                == 0
+            )
     if profile.exists() and loaded:
         add("OK", "AppArmor profile", f"{profile}（已加载）")
     elif profile.exists():
@@ -320,6 +350,14 @@ async def _doctor(config: BridgeConfig, db: BridgeDB) -> int:
         add("WARN", "审批策略", f"当前为 {config.approval_policy}；建议 on-request")
     else:
         add("OK", "审批策略", "on-request + reviewer=user")
+    if config.sandbox == "danger-full-access":
+        add("WARN", "沙箱", "danger-full-access；仅应在隔离主机上显式使用")
+    else:
+        add("OK", "沙箱", config.sandbox)
+    if config.allow_remote_full_access:
+        add("WARN", "远程完全访问", "已启用；飞书端可以切换到完整主机权限")
+    else:
+        add("OK", "远程完全访问", "已禁用")
     add("OK", "数据库", f"{config.database_path}；inbox={db.inbox_counts() or {'empty': 0}}")
 
     for level, name, detail in checks:
@@ -345,7 +383,7 @@ async def _verify_feishu_app(app_id: str, secret: str) -> tuple[bool, str]:
             return True, "App ID/Secret 有效"
         return False, f"code={payload.get('code')} msg={payload.get('msg', '')}"
     except Exception as error:
-        return False, f"无法验证：{error}"
+        return False, f"无法验证：{redact_log(error)}"
 
 
 def _missing_app_credentials(config: BridgeConfig) -> list[str]:
@@ -378,9 +416,14 @@ def _ensure_local_files(config_path: Path) -> None:
     config_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     if not config_path.exists():
         example = PROJECT_ROOT / "config.example.toml"
-        if not example.exists():
-            raise RuntimeError(f"找不到配置模板 {example}")
-        config_path.write_text(example.read_text(encoding="utf-8"), encoding="utf-8")
+        if example.exists():
+            template = example.read_text(encoding="utf-8")
+        else:
+            packaged = resources.files("codex_feishu_bridge").joinpath("config.example.toml")
+            template = packaged.read_text(encoding="utf-8")
+        config_path.write_text(template, encoding="utf-8")
+        config_path.chmod(0o600)
+    elif config_path.is_file():
         config_path.chmod(0o600)
     secret_path = config_path.parent / "secrets.env"
     if not secret_path.exists():
@@ -389,11 +432,11 @@ def _ensure_local_files(config_path: Path) -> None:
             encoding="utf-8",
         )
         secret_path.chmod(0o600)
+    elif secret_path.is_file():
+        secret_path.chmod(0o600)
 
 
 def _suggest_title(thread: ThreadSummary) -> str:
-    if thread.thread_id in DEPLOYMENT_INITIAL_THREADS:
-        return DEPLOYMENT_INITIAL_THREADS[thread.thread_id]
     if thread.name and thread.name.strip():
         return thread.name.strip()
     preview = thread.preview.lower()
@@ -412,7 +455,7 @@ def _filter_internal_threads(
     return [
         thread
         for thread in threads
-        if not (thread.name or "").startswith("因时管理员临时-")
+        if not (thread.name or "").startswith("飞行桥临时任务-")
         and db.get_setting(f"exclude_thread:{thread.thread_id}", "0") != "1"
         and Path(thread.cwd).expanduser().resolve(strict=False) != admin_scratch
     ]
@@ -424,7 +467,9 @@ def _print_bindings(db: BridgeDB) -> None:
         print("（暂无）")
         return
     for index, binding in enumerate(bindings, 1):
-        state = f"飞书 chat={binding.chat_id}" if binding.chat_id else f"{binding.sync_state}/待创建"
+        state = (
+            f"飞书 chat={binding.chat_id}" if binding.chat_id else f"{binding.sync_state}/待创建"
+        )
         print(f"{index}. {binding.title}")
         print(f"   thread={binding.thread_id}")
         print(f"   cwd={binding.cwd}")

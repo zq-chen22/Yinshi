@@ -5,10 +5,9 @@ import hashlib
 import json
 import logging
 import multiprocessing
-import os
 import re
 import secrets
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -23,8 +22,8 @@ from lark_oapi.api.im.v1 import (
     CreateMessageRequest,
     CreateMessageRequestBody,
     GetMessageResourceRequest,
-    ListMessageRequest,
     ListChatRequest,
+    ListMessageRequest,
     PatchMessageRequest,
     PatchMessageRequestBody,
     UpdateChatRequest,
@@ -39,9 +38,9 @@ from .config import BridgeConfig, FeishuAppConfig
 from .db import BridgeDB
 from .models import AppRole, Attachment, IncomingMessage
 
-
 LOG = logging.getLogger(__name__)
 ReceiveIdType = Literal["chat_id", "open_id"]
+IMAGE_FILE_SUFFIXES = frozenset({".bmp", ".gif", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"})
 
 
 class FeishuAPIError(RuntimeError):
@@ -58,16 +57,23 @@ def conversation_group_name(title: str, suffix: str) -> str:
     return f"{clean[:max_title]}{suffix}"
 
 
-def conversation_group_description(thread_id: str, cwd: str, created_at: int) -> str:
-    clean_cwd = re.sub(r"[\r\n\t]+", " ", cwd).strip() or "未知"
+def conversation_binding_marker(thread_id: str) -> str:
+    digest = hashlib.sha256(f"thread:{thread_id}".encode()).hexdigest()[:32]
+    return f"feixing-binding:{digest}"
+
+
+def conversation_group_description(thread_id: str, cwd: str, created_at: int, *, show_workspace_path: bool = False) -> str:
     timestamp = created_at / 1000 if created_at > 10_000_000_000 else created_at
     if timestamp > 0:
-        started = datetime.fromtimestamp(timestamp, tz=timezone.utc).astimezone().isoformat(
-            sep=" ", timespec="seconds"
+        started = (
+            datetime.fromtimestamp(timestamp, tz=UTC)
+            .astimezone()
+            .isoformat(sep=" ", timespec="seconds")
         )
     else:
         started = "未知"
-    return f"目录：{clean_cwd}\n开始：{started}\ncodex-thread:{thread_id}"
+    workspace = cwd if show_workspace_path else "已隐藏"
+    return f"本地工作区：{workspace}\n开始：{started}\n{conversation_binding_marker(thread_id)}"
 
 
 def progress_card(title: str, text: str, *, color: str = "blue") -> dict[str, Any]:
@@ -222,9 +228,7 @@ class FeishuGateway:
             raise FeishuAPIError("Feishu send succeeded without a message_id")
         return str(message_id)
 
-    async def patch_card(
-        self, role: AppRole, message_id: str, card: dict[str, Any]
-    ) -> None:
+    async def patch_card(self, role: AppRole, message_id: str, card: dict[str, Any]) -> None:
         request = (
             PatchMessageRequest.builder()
             .message_id(message_id)
@@ -255,7 +259,7 @@ class FeishuGateway:
         body = (
             CreateChatRequestBody.builder()
             .name(name)
-            .description(conversation_group_description(thread_id, cwd, created_at))
+            .description(conversation_group_description(thread_id, cwd, created_at, show_workspace_path=self.config.show_workspace_path))
             .owner_id(owner_open_id)
             .user_id_list([owner_open_id])
             .group_message_type("chat")
@@ -294,7 +298,7 @@ class FeishuGateway:
             .chat_id(chat_id)
             .request_body(
                 UpdateChatRequestBody.builder()
-                .description(conversation_group_description(thread_id, cwd, created_at))
+                .description(conversation_group_description(thread_id, cwd, created_at, show_workspace_path=self.config.show_workspace_path))
                 .build()
             )
             .build()
@@ -308,8 +312,13 @@ class FeishuGateway:
     async def find_conversation_chat(
         self, thread_id: str, owner_open_id: str
     ) -> tuple[str, str] | None:
-        marker = f"codex-thread:{thread_id}"
-        page_token = ""
+        markers = {
+            conversation_binding_marker(thread_id),
+            # Migration support for private deployments created before the
+            # public release. New descriptions never expose the raw id.
+            f"codex-thread:{thread_id}",
+        }
+        page_token: str | None = None
         while True:
             builder = ListChatRequest.builder().user_id_type("open_id").page_size(100)
             if page_token:
@@ -321,7 +330,7 @@ class FeishuGateway:
             )
             for chat in response.data.items or []:
                 if (
-                    marker in str(chat.description or "")
+                    any(marker in str(chat.description or "") for marker in markers)
                     and str(chat.owner_id or "") == owner_open_id
                     and str(chat.chat_status or "normal") != "disbanded"
                 ):
@@ -331,14 +340,15 @@ class FeishuGateway:
             page_token = str(response.data.page_token)
 
     async def download_attachment(self, role: AppRole, attachment: Attachment) -> tuple[bytes, str]:
-        key = attachment.image_key if attachment.kind == "image" else attachment.file_key
+        image_resource = attachment.kind == "image" and bool(attachment.image_key)
+        key = attachment.image_key if image_resource else attachment.file_key
         if not key:
             raise FeishuAPIError("attachment does not have a resource key")
         request = (
             GetMessageResourceRequest.builder()
             .message_id(attachment.message_id)
             .file_key(key)
-            .type("image" if attachment.kind == "image" else "file")
+            .type("image" if image_resource else "file")
             .build()
         )
         response = await self._api_call(
@@ -364,7 +374,7 @@ class FeishuGateway:
         """Backfill a chat with a one-second overlap and message-id dedupe upstream."""
 
         result: list[IncomingMessage] = []
-        page_token = ""
+        page_token: str | None = None
         while True:
             builder = (
                 ListMessageRequest.builder()
@@ -384,9 +394,7 @@ class FeishuGateway:
             )
             for item in response.data.items or []:
                 try:
-                    incoming = _normalize_history_message(
-                        item, role, self._apps()[role].app_id
-                    )
+                    incoming = _normalize_history_message(item, role, self._apps()[role].app_id)
                 except Exception:
                     LOG.warning("Ignoring malformed Feishu history item", exc_info=True)
                     continue
@@ -419,9 +427,13 @@ class FeishuGateway:
             if real.stat().st_size > 10 * 1024 * 1024:
                 raise FeishuAPIError("image exceeds Feishu's 10 MiB upload limit")
             with real.open("rb") as handle:
-                request = CreateImageRequest.builder().request_body(
-                    CreateImageRequestBody.builder().image_type("message").image(handle).build()
-                ).build()
+                request = (
+                    CreateImageRequest.builder()
+                    .request_body(
+                        CreateImageRequestBody.builder().image_type("message").image(handle).build()
+                    )
+                    .build()
+                )
                 response = await self._api_call(
                     role, "image.upload", client.im.v1.image.acreate(request)
                 )
@@ -434,16 +446,18 @@ class FeishuGateway:
             )
         file_type = "mp4" if real.suffix.lower() == ".mp4" else "stream"
         with real.open("rb") as handle:
-            request = CreateFileRequest.builder().request_body(
-                CreateFileRequestBody.builder()
-                .file_type(file_type)
-                .file_name(real.name)
-                .file(handle)
+            request = (
+                CreateFileRequest.builder()
+                .request_body(
+                    CreateFileRequestBody.builder()
+                    .file_type(file_type)
+                    .file_name(real.name)
+                    .file(handle)
+                    .build()
+                )
                 .build()
-            ).build()
-            response = await self._api_call(
-                role, "file.upload", client.im.v1.file.acreate(request)
             )
+            response = await self._api_call(role, "file.upload", client.im.v1.file.acreate(request))
         return await self.send_message(
             role,
             chat_id,
@@ -534,33 +548,12 @@ def _normalize_message(data: Any, role: AppRole, expected_app_id: str) -> Incomi
     except json.JSONDecodeError:
         content = {}
     message_type = str(message.message_type or "text")
-    text = str(content.get("text") or "") if message_type == "text" else ""
+    text, attachments = _normalize_message_content(str(message.message_id), message_type, content)
     for mention in message.mentions or []:
         key = getattr(mention, "key", None)
         if key:
             text = text.replace(str(key), "")
     text = text.strip()
-    attachments: list[Attachment] = []
-    if message_type == "image" and content.get("image_key"):
-        attachments.append(
-            Attachment(
-                kind="image",
-                name="image",
-                message_id=str(message.message_id),
-                image_key=str(content["image_key"]),
-            )
-        )
-    elif message_type in {"file", "audio", "media"} and content.get("file_key"):
-        kind = message_type if message_type in {"audio", "media"} else "file"
-        attachments.append(
-            Attachment(
-                kind=kind,
-                name=str(content.get("file_name") or message_type),
-                message_id=str(message.message_id),
-                file_key=str(content["file_key"]),
-                image_key=str(content["image_key"]) if content.get("image_key") else None,
-            )
-        )
     return IncomingMessage(
         message_id=str(message.message_id),
         chat_id=str(message.chat_id),
@@ -604,7 +597,15 @@ def _normalize_card_action(
             effort = str(value.get("effort") or "")
             if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}", model):
                 return None
-            if effort and effort not in {"default", "low", "medium", "high", "xhigh", "max", "ultra"}:
+            if effort and effort not in {
+                "default",
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max",
+                "ultra",
+            }:
                 return None
             command = f"/model {model}" + (f" {effort}" if effort else "")
         elif setting == "permissions":
@@ -650,31 +651,10 @@ def _normalize_history_message(item: Any, role: AppRole, app_id: str) -> Incomin
         content = json.loads(getattr(getattr(item, "body", None), "content", "") or "{}")
     except json.JSONDecodeError:
         content = {}
-    text = str(content.get("text") or "") if message_type == "text" else ""
+    text, attachments = _normalize_message_content(str(item.message_id), message_type, content)
     for mention in item.mentions or []:
         if mention.key:
             text = text.replace(str(mention.key), "")
-    attachments: list[Attachment] = []
-    if message_type == "image" and content.get("image_key"):
-        attachments.append(
-            Attachment(
-                kind="image",
-                name="image",
-                message_id=str(item.message_id),
-                image_key=str(content["image_key"]),
-            )
-        )
-    elif message_type in {"file", "audio", "media"} and content.get("file_key"):
-        kind = message_type if message_type in {"audio", "media"} else "file"
-        attachments.append(
-            Attachment(
-                kind=kind,
-                name=str(content.get("file_name") or message_type),
-                message_id=str(item.message_id),
-                file_key=str(content["file_key"]),
-                image_key=str(content["image_key"]) if content.get("image_key") else None,
-            )
-        )
     sender = getattr(item, "sender", None)
     sender_id = str(getattr(sender, "id", "") or "")
     id_type = str(getattr(sender, "id_type", "") or "")
@@ -694,6 +674,171 @@ def _normalize_history_message(item: Any, role: AppRole, app_id: str) -> Incomin
         sender_type=str(getattr(sender, "sender_type", "system") or "system"),
         attachments=attachments,
     )
+
+
+def _normalize_message_content(
+    message_id: str, message_type: str, content: Any
+) -> tuple[str, list[Attachment]]:
+    if not isinstance(content, dict):
+        return "", []
+    if message_type == "text":
+        return _utf8_head(str(content.get("text") or ""), 120000), []
+    if message_type == "post":
+        return _normalize_post_content(message_id, content)
+
+    attachments: list[Attachment] = []
+    if message_type == "image" and content.get("image_key"):
+        attachments.append(
+            Attachment(
+                kind="image",
+                name="image",
+                message_id=message_id,
+                image_key=str(content["image_key"]),
+            )
+        )
+    elif message_type in {"file", "audio", "media"} and content.get("file_key"):
+        kind = message_type if message_type in {"audio", "media"} else "file"
+        attachments.append(
+            Attachment(
+                kind=kind,
+                name=str(content.get("file_name") or message_type),
+                message_id=message_id,
+                file_key=str(content["file_key"]),
+                image_key=str(content["image_key"]) if content.get("image_key") else None,
+            )
+        )
+    return "", attachments
+
+
+def _normalize_post_content(
+    message_id: str, content: dict[str, Any]
+) -> tuple[str, list[Attachment]]:
+    post = _select_post_payload(content)
+    title = str(post.get("title") or "").strip()
+    blocks = post.get("content_v2")
+    if not isinstance(blocks, list):
+        blocks = post.get("content")
+    if not isinstance(blocks, list):
+        blocks = []
+
+    lines: list[str] = []
+    attachments: list[Attachment] = []
+    for block in blocks:
+        elements = block if isinstance(block, list) else [block]
+        fragments: list[str] = []
+        for element in elements:
+            if not isinstance(element, dict):
+                continue
+            fragment = _post_element_text(element)
+            if fragment:
+                fragments.append(fragment)
+            attachment = _post_element_attachment(message_id, element)
+            if attachment is not None:
+                attachments.append(attachment)
+        line = "".join(fragments).strip()
+        if line:
+            lines.append(line)
+
+    payloads = [post] if post is content else [post, content]
+    for payload in payloads:
+        files = payload.get("files")
+        if not isinstance(files, list):
+            continue
+        for record in files:
+            if not isinstance(record, dict):
+                continue
+            if record.get("is_folder"):
+                name = str(record.get("file_name") or "未命名文件夹")
+                lines.append(f"[飞书文件夹附件：{name}；暂不支持直接读取，请打包后发送。]")
+                continue
+            attachment = _post_file_attachment(message_id, record)
+            if attachment is not None:
+                attachments.append(attachment)
+
+    unique_attachments: list[Attachment] = []
+    seen_resources: dict[tuple[str, str], int] = {}
+    for attachment in attachments:
+        image_resource = attachment.kind == "image" and bool(attachment.image_key)
+        key = attachment.image_key if image_resource else attachment.file_key
+        resource = ("image" if image_resource else "file", str(key or ""))
+        if resource not in seen_resources:
+            seen_resources[resource] = len(unique_attachments)
+            unique_attachments.append(attachment)
+        elif attachment.kind == "image":
+            index = seen_resources[resource]
+            if unique_attachments[index].kind == "file":
+                unique_attachments[index] = attachment
+    parts = [part for part in [title, *lines] if part]
+    return _utf8_head("\n".join(parts), 120000), unique_attachments
+
+
+def _select_post_payload(content: dict[str, Any]) -> dict[str, Any]:
+    if isinstance(content.get("content_v2"), list) or isinstance(content.get("content"), list):
+        return content
+    for locale in ("zh_cn", "en_us", "ja_jp"):
+        localized = content.get(locale)
+        if isinstance(localized, dict):
+            return localized
+    localized = next((value for value in content.values() if isinstance(value, dict)), None)
+    return localized or content
+
+
+def _post_element_text(element: dict[str, Any]) -> str:
+    tag = str(element.get("tag") or "")
+    text = str(element.get("text") or "")
+    if tag in {"text", "md"}:
+        return text
+    if tag == "a":
+        href = str(element.get("href") or "")
+        label = text or href
+        return f"[{label}]({href})" if label and href else label
+    if tag == "at":
+        name = str(element.get("user_name") or element.get("name") or text).lstrip("@")
+        return f"@{name}" if name else ""
+    if tag == "emotion":
+        emoji = str(element.get("emoji_type") or element.get("emoji_key") or "")
+        return f":{emoji}:" if emoji else ""
+    if tag in {"br", "line_break"}:
+        return "\n"
+    if tag in {"hr", "divider"}:
+        return "---"
+    if tag == "code_block":
+        language = str(element.get("language") or "")
+        return f"```{language}\n{text}\n```" if text else ""
+    return text
+
+
+def _post_element_attachment(message_id: str, element: dict[str, Any]) -> Attachment | None:
+    tag = str(element.get("tag") or "")
+    image_key = element.get("image_key")
+    if tag in {"img", "image"} and image_key:
+        return Attachment(
+            kind="image",
+            name="post-image",
+            message_id=message_id,
+            image_key=str(image_key),
+        )
+    if tag == "file":
+        return _post_file_attachment(message_id, element)
+    file_key = element.get("file_key")
+    if tag in {"media", "audio"} and file_key:
+        return Attachment(
+            kind=tag,
+            name=str(element.get("file_name") or tag),
+            message_id=message_id,
+            file_key=str(file_key),
+            image_key=str(image_key) if image_key else None,
+        )
+    return None
+
+
+def _post_file_attachment(message_id: str, record: dict[str, Any]) -> Attachment | None:
+    file_key = record.get("file_key")
+    if record.get("is_folder") or not isinstance(file_key, str) or not file_key.strip():
+        return None
+    name = str(record.get("file_name") or "file")
+    kind = "image" if Path(name).suffix.lower() in IMAGE_FILE_SUFFIXES else "file"
+    return Attachment(kind=kind, name=name, message_id=message_id, file_key=file_key)
 
 
 def _utf8_head(text: str, max_bytes: int) -> str:

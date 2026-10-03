@@ -13,12 +13,12 @@ from .models import (
     InboxItem,
     IncomingMessage,
     OutboxItem,
-    PendingArtifact,
     PendingApproval,
+    PendingArtifact,
     ThreadSummary,
     TurnJob,
 )
-
+from .privacy import redact_log
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -187,8 +187,7 @@ class BridgeDB:
         with self._lock:
             self._conn.executescript(SCHEMA)
             binding_columns = {
-                str(row[1])
-                for row in self._conn.execute("PRAGMA table_info(bindings)").fetchall()
+                str(row[1]) for row in self._conn.execute("PRAGMA table_info(bindings)").fetchall()
             }
             if "thread_created_at" not in binding_columns:
                 self._conn.execute(
@@ -206,9 +205,7 @@ class BridgeDB:
                 self._conn.execute(
                     "ALTER TABLE outbox_messages ADD COLUMN sequence INTEGER NOT NULL DEFAULT 0"
                 )
-            self._conn.execute(
-                "UPDATE outbox_messages SET group_key=outbox_key WHERE group_key=''"
-            )
+            self._conn.execute("UPDATE outbox_messages SET group_key=outbox_key WHERE group_key=''")
             self._conn.execute("PRAGMA busy_timeout=1500")
             self._conn.commit()
 
@@ -226,7 +223,9 @@ class BridgeDB:
         with self._lock:
             self._conn.execute(
                 """INSERT INTO settings(key, value, updated_at) VALUES(?, ?, ?)
-                   ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at""",
+                   ON CONFLICT(key) DO UPDATE SET
+                       value=excluded.value,
+                       updated_at=excluded.updated_at""",
                 (key, value, now),
             )
             self._conn.commit()
@@ -236,9 +235,53 @@ class BridgeDB:
             self._conn.execute("DELETE FROM settings WHERE key=?", (key,))
             self._conn.commit()
 
-    def set_runtime_config(
-        self, scope: str, name: str, value: str, *, message_id: str
-    ) -> None:
+    def prune_retained_data(self, retention_days: int, *, now: int | None = None) -> dict[str, int]:
+        """Delete expired operational records that may contain message content.
+
+        Rows still needed for pending, held, retrying, or ambiguous work are
+        deliberately retained. Idempotency markers and thread bindings do not
+        contain message bodies and remain intact.
+        """
+
+        statements = {
+            "inbox_messages": (
+                "DELETE FROM inbox_messages WHERE state IN ('done', 'dead') AND updated_at < ?"
+            ),
+            "outbox_messages": (
+                "DELETE FROM outbox_messages WHERE state IN ('done', 'dead') AND updated_at < ?"
+            ),
+            "runtime_config_events": ("DELETE FROM runtime_config_events WHERE changed_at < ?"),
+            "turn_jobs": (
+                "DELETE FROM turn_jobs "
+                "WHERE state IN ('delivered', 'failed', 'interrupted') AND updated_at < ?"
+            ),
+            "artifact_approvals": (
+                "DELETE FROM artifact_approvals WHERE state != 'pending' AND updated_at < ?"
+            ),
+            "pending_approvals": (
+                "DELETE FROM pending_approvals WHERE state != 'pending' AND updated_at < ?"
+            ),
+        }
+        counts = {table: 0 for table in statements}
+        if retention_days == 0:
+            return counts
+        if retention_days < 0:
+            raise ValueError("retention_days cannot be negative")
+        current = int(time.time()) if now is None else int(now)
+        cutoff = current - retention_days * 24 * 3600
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                for table, statement in statements.items():
+                    cursor = self._conn.execute(statement, (cutoff,))
+                    counts[table] = cursor.rowcount
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        return counts
+
+    def set_runtime_config(self, scope: str, name: str, value: str, *, message_id: str) -> None:
         key = f"runtime:{scope}:{name}"
         now = int(time.time())
         with self._lock:
@@ -342,11 +385,19 @@ class BridgeDB:
     def record_api_result(self, app_role: str, operation: str, *, success: bool) -> None:
         now = int(time.time())
         period = time.strftime("%Y-%m", time.localtime(now))
-        column = "successes" if success else "failures"
+        if success:
+            statement = (
+                "UPDATE api_call_usage SET successes=successes + 1, updated_at=? "
+                "WHERE period=? AND app_role=? AND operation=?"
+            )
+        else:
+            statement = (
+                "UPDATE api_call_usage SET failures=failures + 1, updated_at=? "
+                "WHERE period=? AND app_role=? AND operation=?"
+            )
         with self._lock:
             self._conn.execute(
-                f"""UPDATE api_call_usage SET {column}={column} + 1, updated_at=?
-                    WHERE period=? AND app_role=? AND operation=?""",
+                statement,
                 (now, period, app_role, operation),
             )
             self._conn.commit()
@@ -411,7 +462,9 @@ class BridgeDB:
         if cur.rowcount != 1:
             raise RuntimeError(f"inbox message cannot be held: {message.message_id}")
 
-    def merge_held_attachments(self, message: IncomingMessage) -> int:
+    def merge_held_attachments(
+        self, message: IncomingMessage, *, allowed_sender_open_ids: set[str] | None = None
+    ) -> int:
         """Atomically attach earlier held media to a claimed text message.
 
         The merged payload is written into the current inbox row before held
@@ -438,7 +491,12 @@ class BridgeDB:
                 }
                 for row in rows:
                     held = self._incoming(json.loads(row["payload_json"]))
-                    if held.sender_open_id != message.sender_open_id:
+                    shared_sender = (
+                        message.app_role == "conversation"
+                        and message.chat_type == held.chat_type == "group"
+                        and held.sender_open_id in (allowed_sender_open_ids or set())
+                    )
+                    if held.sender_open_id != message.sender_open_id and not shared_sender:
                         continue
                     held_ids.append(str(row["message_id"]))
                     for attachment in held.attachments:
@@ -611,7 +669,7 @@ class BridgeDB:
             self._conn.execute(
                 """UPDATE inbox_messages SET state='ambiguous', lease_owner=NULL,
                    lease_until=NULL, last_error=?, updated_at=? WHERE message_id=?""",
-                (error[:2000], int(time.time()), message_id),
+                (redact_log(error, max_chars=2000), int(time.time()), message_id),
             )
             self._conn.commit()
 
@@ -653,7 +711,13 @@ class BridgeDB:
             self._conn.execute(
                 """UPDATE inbox_messages SET state=?, available_at=?, lease_owner=NULL,
                    lease_until=NULL, last_error=?, updated_at=? WHERE message_id=?""",
-                ("dead" if dead else "retry", now + retry_after_seconds, error[:2000], now, message_id),
+                (
+                    "dead" if dead else "retry",
+                    now + retry_after_seconds,
+                    redact_log(error, max_chars=2000),
+                    now,
+                    message_id,
+                ),
             )
             self._conn.commit()
 
@@ -834,8 +898,9 @@ class BridgeDB:
     ) -> None:
         with self._lock:
             self._conn.execute(
-                """UPDATE outbox_messages SET state='done', lease_owner=NULL,
-                   lease_until=NULL, last_error=NULL, updated_at=? WHERE outbox_key=?""",
+                """UPDATE outbox_messages SET state='done', content_json='{}',
+                   lease_owner=NULL, lease_until=NULL, last_error=NULL,
+                   updated_at=? WHERE outbox_key=?""",
                 (int(time.time()), outbox_key),
             )
             if thread_id and turn_id:
@@ -868,7 +933,7 @@ class BridgeDB:
                 (
                     "dead" if dead else "retry",
                     now + retry_after_seconds,
-                    error[:2000],
+                    redact_log(error, max_chars=2000),
                     now,
                     outbox_key,
                 ),
@@ -1026,9 +1091,7 @@ class BridgeDB:
             )
             self._conn.commit()
 
-    def get_artifact_approval(
-        self, approval_id: str, chat_id: str
-    ) -> PendingArtifact | None:
+    def get_artifact_approval(self, approval_id: str, chat_id: str) -> PendingArtifact | None:
         with self._lock:
             row = self._conn.execute(
                 """SELECT * FROM artifact_approvals
@@ -1076,7 +1139,10 @@ class BridgeDB:
                            THEN excluded.thread_created_at
                            ELSE bindings.thread_created_at
                        END,
-                       thread_updated_at=MAX(bindings.thread_updated_at, excluded.thread_updated_at),
+                       thread_updated_at=MAX(
+                           bindings.thread_updated_at,
+                           excluded.thread_updated_at
+                       ),
                        updated_at=excluded.updated_at""",
                 (
                     thread.thread_id,
@@ -1090,7 +1156,8 @@ class BridgeDB:
             )
             self._conn.commit()
         binding = self.get_binding_by_thread(thread.thread_id)
-        assert binding is not None
+        if binding is None:
+            raise RuntimeError("thread binding disappeared after registration")
         return binding
 
     def refresh_thread_metadata(self, thread: ThreadSummary) -> Binding | None:
@@ -1173,7 +1240,9 @@ class BridgeDB:
 
     def get_binding_by_thread(self, thread_id: str) -> Binding | None:
         with self._lock:
-            row = self._conn.execute("SELECT * FROM bindings WHERE thread_id=?", (thread_id,)).fetchone()
+            row = self._conn.execute(
+                "SELECT * FROM bindings WHERE thread_id=?", (thread_id,)
+            ).fetchone()
         return self._binding(row) if row else None
 
     def get_binding_by_chat(self, chat_id: str) -> Binding | None:

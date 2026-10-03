@@ -8,22 +8,28 @@ import os
 import socket
 import sqlite3
 import time
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import httpx
 
 from .config import BridgeConfig
 from .db import BridgeDB
-
+from .privacy import log_ref
+from .quota_stats import daily_quota, format_percent, load_samples, read_weekly_quota, save_sample
 
 LOG = logging.getLogger(__name__)
 BRIDGE_CONSTRAINT_MARKER = "飞书桥交付约束："
 TOTAL_HEADER = "总任务"
 LONG_HEADER = "长任务"
+QUOTA_GROUP_SUFFIX = "·额度"
+REMAINING_HEADER = "剩余周额度"
+DAILY_USAGE_HEADER = "当日观测用量"
+SUMMARY_HEADER = "全设备汇总"
 
 
 class DailyStatsError(RuntimeError):
@@ -49,7 +55,11 @@ class DailyCount:
 class SyncResult:
     identity: HostIdentity
     column_start_index: int
+    quota_column_start_index: int
+    summary_column_start_index: int
+    summary_row_count: int
     counts: tuple[DailyCount, ...]
+    quota_cells: tuple[tuple[date, str, str], ...]
     sheet_title: str
     read_verified: bool
     write_verified: bool
@@ -78,7 +88,7 @@ class FeishuSheetsClient:
         self.app_id = app_id
         self.app_secret = app_secret
         self._db = db
-        self._token = ""
+        self._token: str | None = None
         self._client = httpx.AsyncClient(
             base_url="https://open.feishu.cn/open-apis",
             timeout=20,
@@ -129,18 +139,16 @@ class FeishuSheetsClient:
         if self._db:
             with contextlib.suppress(Exception):
                 self._db.record_api_attempt("conversation", operation)
+        if authenticated and not self._token:
+            raise DailyStatsError("Feishu client is not authenticated")
         headers = {"Authorization": f"Bearer {self._token}"} if authenticated else None
         try:
-            response = await self._client.request(
-                method, path, headers=headers, json=json_body
-            )
+            response = await self._client.request(method, path, headers=headers, json=json_body)
             payload = _json_response(response, f"{method} {path.split('?')[0]}")
         except BaseException:
             if self._db:
                 with contextlib.suppress(Exception):
-                    self._db.record_api_result(
-                        "conversation", operation, success=False
-                    )
+                    self._db.record_api_result("conversation", operation, success=False)
             raise
         if self._db:
             with contextlib.suppress(Exception):
@@ -168,15 +176,12 @@ class FeishuSheetsClient:
     async def document_permission(self, spreadsheet_token: str, action: str) -> bool:
         payload = await self.request(
             "GET",
-            f"/drive/v1/permissions/{spreadsheet_token}/members/auth"
-            f"?action={action}&type=sheet",
+            f"/drive/v1/permissions/{spreadsheet_token}/members/auth?action={action}&type=sheet",
             operation=f"sheet.permission.{action}",
         )
         return bool((payload.get("data") or {}).get("auth_result"))
 
-    async def values(
-        self, spreadsheet_token: str, range_name: str
-    ) -> list[list[Any]]:
+    async def values(self, spreadsheet_token: str, range_name: str) -> list[list[Any]]:
         payload = await self.request(
             "GET",
             f"/sheets/v2/spreadsheets/{spreadsheet_token}/values/{range_name}",
@@ -207,9 +212,7 @@ class FeishuSheetsClient:
             json_body={"valueRanges": value_ranges},
         )
 
-    async def merge_cells(
-        self, spreadsheet_token: str, range_name: str
-    ) -> None:
+    async def merge_cells(self, spreadsheet_token: str, range_name: str) -> None:
         await self.request(
             "POST",
             f"/sheets/v2/spreadsheets/{spreadsheet_token}/merge_cells",
@@ -217,9 +220,7 @@ class FeishuSheetsClient:
             json_body={"range": range_name, "mergeType": "MERGE_ALL"},
         )
 
-    async def insert_row(
-        self, spreadsheet_token: str, sheet_id: str, row_number: int
-    ) -> None:
+    async def insert_row(self, spreadsheet_token: str, sheet_id: str, row_number: int) -> None:
         start_index = row_number - 1
         await self.request(
             "POST",
@@ -231,6 +232,24 @@ class FeishuSheetsClient:
                     "majorDimension": "ROWS",
                     "startIndex": start_index,
                     "endIndex": start_index + 1,
+                },
+                "inheritStyle": "AFTER",
+            },
+        )
+
+    async def insert_columns(
+        self, spreadsheet_token: str, sheet_id: str, start_column: int
+    ) -> None:
+        await self.request(
+            "POST",
+            f"/sheets/v2/spreadsheets/{spreadsheet_token}/insert_dimension_range",
+            operation="sheet.columns.insert",
+            json_body={
+                "dimension": {
+                    "sheetId": sheet_id,
+                    "majorDimension": "COLUMNS",
+                    "startIndex": start_column,
+                    "endIndex": start_column + 2,
                 },
                 "inheritStyle": "BEFORE",
             },
@@ -338,6 +357,134 @@ def choose_group_column(
     return start
 
 
+def choose_quota_column(
+    header_rows: list[list[Any]],
+    bot_name: str,
+    *,
+    column_count: int,
+    previous_identity: dict[str, Any] | None = None,
+) -> int:
+    first = _padded_row(header_rows, 0, column_count)
+    second = _padded_row(header_rows, 1, column_count)
+    title = f"{bot_name}{QUOTA_GROUP_SUFFIX}"
+    if previous_identity:
+        candidate = previous_identity.get("quota_column_start_index")
+        previous_name = str(previous_identity.get("bot_name") or "")
+        previous_title = f"{previous_name}{QUOTA_GROUP_SUFFIX}"
+        if isinstance(candidate, int) and 1 <= candidate < column_count - 1:
+            if (
+                str(first[candidate] or "") in {title, previous_title}
+                and str(second[candidate] or "") == REMAINING_HEADER
+                and str(second[candidate + 1] or "") == DAILY_USAGE_HEADER
+            ):
+                return candidate
+    matches = [index for index, value in enumerate(first) if str(value or "") == title]
+    exact = [
+        index
+        for index in matches
+        if index + 1 < column_count
+        and str(second[index] or "") == REMAINING_HEADER
+        and str(second[index + 1] or "") == DAILY_USAGE_HEADER
+    ]
+    if len(exact) > 1:
+        raise DailyStatsError(f"sheet contains duplicate quota groups for bot {bot_name!r}")
+    if exact:
+        return exact[0]
+    if matches:
+        raise DailyStatsError(f"sheet quota header for bot {bot_name!r} has unexpected subcolumns")
+    used = [0]
+    for index in range(column_count):
+        if first[index] not in (None, "") or second[index] not in (None, ""):
+            used.append(index)
+    start = max(1, max(used) + 1)
+    if start + 1 >= column_count:
+        raise DailyStatsError("sheet does not have two empty quota columns for this bot")
+    return start
+
+
+def find_summary_column(header_rows: list[list[Any]], column_count: int) -> int | None:
+    first = _padded_row(header_rows, 0, column_count)
+    second = _padded_row(header_rows, 1, column_count)
+    matches = [index for index, value in enumerate(first) if str(value or "") == SUMMARY_HEADER]
+    if len(matches) > 1:
+        raise DailyStatsError("sheet contains duplicate summary groups")
+    if not matches:
+        return None
+    start = matches[0]
+    if (
+        start < 1
+        or start + 1 >= column_count
+        or str(second[start] or "") != TOTAL_HEADER
+        or str(second[start + 1] or "") != LONG_HEADER
+    ):
+        raise DailyStatsError("sheet summary header has unexpected subcolumns")
+    return start
+
+
+def summary_formula(row_number: int, summary_start: int, column_count: int, header: str) -> str:
+    if header not in {TOTAL_HEADER, LONG_HEADER}:
+        raise ValueError(header)
+    segments = []
+    if summary_start > 1:
+        segments.append((1, summary_start - 1))
+    if summary_start + 2 < column_count:
+        segments.append((summary_start + 2, column_count - 1))
+    return (
+        "="
+        + "+".join(
+            f'SUMIF({column_name(left)}$2:{column_name(right)}$2,"{header}",'
+            f"{column_name(left)}{row_number}:{column_name(right)}{row_number})"
+            for left, right in segments
+        )
+        if segments
+        else "=0"
+    )
+
+
+def summary_value_ranges(
+    sheet_id: str, rows: dict[date, int], summary_start: int, column_count: int
+) -> list[dict[str, Any]]:
+    ranges: list[dict[str, Any]] = []
+    first_row = 0
+    last_row = 0
+    values: list[list[Any]] = []
+    for row_number in sorted(rows.values()):
+        if values and row_number != last_row + 1:
+            ranges.append(
+                {
+                    "range": (
+                        f"{sheet_id}!{column_name(summary_start)}{first_row}:"
+                        f"{column_name(summary_start + 1)}{last_row}"
+                    ),
+                    "values": values,
+                }
+            )
+            values = []
+        if not values:
+            first_row = row_number
+        last_row = row_number
+        values.append(
+            [
+                {
+                    "type": "formula",
+                    "text": summary_formula(row_number, summary_start, column_count, header),
+                }
+                for header in (TOTAL_HEADER, LONG_HEADER)
+            ]
+        )
+    if values:
+        ranges.append(
+            {
+                "range": (
+                    f"{sheet_id}!{column_name(summary_start)}{first_row}:"
+                    f"{column_name(summary_start + 1)}{last_row}"
+                ),
+                "values": values,
+            }
+        )
+    return ranges
+
+
 def _padded_row(rows: list[list[Any]], index: int, width: int) -> list[Any]:
     row = list(rows[index]) if index < len(rows) else []
     return row + [None] * max(0, width - len(row))
@@ -383,9 +530,7 @@ async def _ensure_date_row(
     target: date,
     row_count: int,
 ) -> int:
-    values = await client.values(
-        spreadsheet_token, f"{sheet_id}!A3:A{max(3, row_count)}"
-    )
+    values = await client.values(spreadsheet_token, f"{sheet_id}!A3:A{max(3, row_count)}")
     rows = _date_rows(values)
     if target in rows:
         return rows[target]
@@ -428,7 +573,9 @@ def _state_database() -> Path:
 def _read_turn_jobs(
     database_path: Path, targets: set[date], timezone_info: ZoneInfo
 ) -> list[_TurnJob]:
-    earliest = datetime.combine(min(targets) - timedelta(days=1), datetime.min.time(), timezone_info)
+    earliest = datetime.combine(
+        min(targets) - timedelta(days=1), datetime.min.time(), timezone_info
+    )
     latest = datetime.combine(max(targets) + timedelta(days=2), datetime.min.time(), timezone_info)
     connection = sqlite3.connect(f"file:{database_path}?mode=ro", uri=True, timeout=5)
     connection.row_factory = sqlite3.Row
@@ -469,10 +616,12 @@ def _rollout_paths(thread_ids: set[str]) -> dict[str, Path]:
     state_path = _state_database()
     connection = sqlite3.connect(f"file:{state_path}?mode=ro", uri=True, timeout=5)
     try:
-        placeholders = ",".join("?" for _ in thread_ids)
+        # Pass the complete id list as one bound JSON value; no SQL identifier
+        # or predicate is assembled from thread data.
         rows = connection.execute(
-            f"SELECT id, rollout_path FROM threads WHERE id IN ({placeholders})",
-            tuple(sorted(thread_ids)),
+            """SELECT id, rollout_path FROM threads
+               WHERE id IN (SELECT value FROM json_each(?))""",
+            (json.dumps(sorted(thread_ids)),),
         ).fetchall()
     finally:
         connection.close()
@@ -495,7 +644,7 @@ def _turn_events(jobs: list[_TurnJob]) -> dict[str, _TurnEvent]:
     for thread_id, turn_ids in by_thread.items():
         path = paths.get(thread_id)
         if not path or not path.exists():
-            LOG.warning("No rollout file found for Codex thread %s", thread_id)
+            LOG.warning("No rollout file found for Codex thread ref=%s", log_ref(thread_id))
             continue
         with path.open("r", encoding="utf-8", errors="replace") as handle:
             for line in handle:
@@ -567,14 +716,19 @@ def _load_identity(path: Path) -> dict[str, Any] | None:
 
 
 def _save_identity(
-    path: Path, identity: HostIdentity, column_start_index: int, config: BridgeConfig
+    path: Path,
+    identity: HostIdentity,
+    column_start_index: int,
+    quota_column_start_index: int,
+    config: BridgeConfig,
 ) -> None:
     payload = {
-        "schema": 1,
+        "schema": 2,
         **asdict(identity),
         "spreadsheet_token": config.daily_stats.spreadsheet_token,
         "sheet_id": config.daily_stats.sheet_id,
         "column_start_index": column_start_index,
+        "quota_column_start_index": quota_column_start_index,
         "updated_at": int(time.time()),
     }
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -604,9 +758,7 @@ def _preservation_snapshot(
     return header, history
 
 
-async def sync_daily_stats(
-    config: BridgeConfig, db: BridgeDB | None = None
-) -> SyncResult:
+async def sync_daily_stats(config: BridgeConfig, db: BridgeDB | None = None) -> SyncResult:
     stats = config.daily_stats
     if not stats.enabled:
         raise DailyStatsError("daily_stats is disabled in config.toml")
@@ -627,6 +779,32 @@ async def sync_daily_stats(
     if previous and str(previous.get("app_id") or "") != app.app_id:
         raise DailyStatsError("daily stats identity belongs to a different Feishu app")
 
+    quota_path = config.state_dir / "daily-stats-quota.json"
+    quota_failed = False
+    try:
+        sample = await read_weekly_quota(config.codex_bin)
+        samples = save_sample(quota_path, sample, timezone_info)
+    except Exception as error:
+        quota_failed = True
+        LOG.warning("Codex weekly quota sample unavailable: %s", type(error).__name__)
+        try:
+            samples = load_samples(quota_path)
+        except Exception:
+            samples = []
+    quotas = daily_quota(samples, set(targets), timezone_info)
+    quota_cells_list: list[tuple[date, str, str]] = []
+    for day in targets:
+        if quota_failed and day == today:
+            quota_cells_list.append((day, "读取失败", "读取失败"))
+        elif day in quotas:
+            quota = quotas[day]
+            quota_cells_list.append(
+                (day, format_percent(quota.remaining_percent), format_percent(quota.used_percent))
+            )
+        else:
+            quota_cells_list.append((day, "", ""))
+    quota_cells = tuple(quota_cells_list)
+
     async with FeishuSheetsClient(app.app_id, app.secret(), db=db) as client:
         bot_name = await client.bot_name()
         identity = HostIdentity(host_id, hostname, bot_name, app.app_id)
@@ -644,25 +822,105 @@ async def sync_daily_stats(
             raise DailyStatsError("target sheet is too small for the daily statistics layout")
         header_range = f"{stats.sheet_id}!A1:{column_name(column_count - 1)}2"
         header_rows = await client.values(stats.spreadsheet_token, header_range)
+        summary_start = find_summary_column(header_rows, column_count)
         start_column = choose_group_column(
             header_rows,
             bot_name,
             column_count=column_count,
             previous_identity=previous,
         )
-        own_columns = {start_column, start_column + 1}
-        compare_width = max(start_column + 2, 3)
+        first = _padded_row(header_rows, 0, column_count)
+        group_missing = first[start_column] in (None, "")
+        if group_missing and summary_start is not None:
+            await client.insert_columns(stats.spreadsheet_token, stats.sheet_id, summary_start)
+            start_column = summary_start
+            sheet = await client.sheet_info(stats.spreadsheet_token, stats.sheet_id)
+            properties = sheet.get("grid_properties") or {}
+            column_count = int(properties.get("column_count") or 0)
+            row_count = int(properties.get("row_count") or 0)
+            header_range = f"{stats.sheet_id}!A1:{column_name(column_count - 1)}2"
+            header_rows = await client.values(stats.spreadsheet_token, header_range)
+            summary_start = find_summary_column(header_rows, column_count)
+            if summary_start is None:
+                raise DailyStatsError("summary group disappeared after column insertion")
+        reserved = [
+            _padded_row(header_rows, 0, column_count),
+            _padded_row(header_rows, 1, column_count),
+        ]
+        if group_missing:
+            reserved[0][start_column] = bot_name
+            reserved[1][start_column] = TOTAL_HEADER
+            reserved[1][start_column + 1] = LONG_HEADER
+        quota_start_column = choose_quota_column(
+            reserved,
+            bot_name,
+            column_count=column_count,
+            previous_identity=previous,
+        )
+        first = _padded_row(header_rows, 0, column_count)
+        quota_missing = first[quota_start_column] in (None, "")
+        if quota_missing and summary_start is not None:
+            await client.insert_columns(stats.spreadsheet_token, stats.sheet_id, summary_start)
+            if start_column >= summary_start:
+                start_column += 2
+            quota_start_column = summary_start
+            sheet = await client.sheet_info(stats.spreadsheet_token, stats.sheet_id)
+            properties = sheet.get("grid_properties") or {}
+            column_count = int(properties.get("column_count") or 0)
+            row_count = int(properties.get("row_count") or 0)
+            header_range = f"{stats.sheet_id}!A1:{column_name(column_count - 1)}2"
+            header_rows = await client.values(stats.spreadsheet_token, header_range)
+            summary_start = find_summary_column(header_rows, column_count)
+            if summary_start is None:
+                raise DailyStatsError("summary group disappeared after column insertion")
+        if summary_start is None:
+            first = _padded_row(header_rows, 0, column_count)
+            second = _padded_row(header_rows, 1, column_count)
+            occupied = [
+                index
+                for index in range(column_count)
+                if first[index] not in (None, "") or second[index] not in (None, "")
+            ]
+            summary_start = max(
+                max(occupied, default=0) + 1, start_column + 2, quota_start_column + 2
+            )
+            if summary_start + 1 >= column_count:
+                raise DailyStatsError("sheet does not have two empty columns for the summary")
+            summary_missing = True
+        else:
+            summary_missing = False
+        own_columns = {
+            start_column,
+            start_column + 1,
+            quota_start_column,
+            quota_start_column + 1,
+            summary_start,
+            summary_start + 1,
+        }
+        compare_width = max(start_column + 2, quota_start_column + 2, summary_start + 2, 3)
         compare_end = column_name(compare_width - 1)
         before_values = await client.values(
             stats.spreadsheet_token, f"{stats.sheet_id}!A1:{compare_end}{row_count}"
         )
+        if summary_missing and any(
+            value not in (None, "")
+            for row in before_values
+            for value in _padded_row([row], 0, compare_width)[summary_start : summary_start + 2]
+        ):
+            raise DailyStatsError("summary target columns contain data without a summary header")
         before_snapshot = _preservation_snapshot(before_values, own_columns, compare_width)
 
         first = _padded_row(header_rows, 0, column_count)
         second = _padded_row(header_rows, 1, column_count)
         left = column_name(start_column)
         right = column_name(start_column + 1)
+        quota_left = column_name(quota_start_column)
+        quota_right = column_name(quota_start_column + 1)
+        summary_left = column_name(summary_start)
+        summary_right = column_name(summary_start + 1)
         merged = _merge_matches(sheet.get("merges") or [], start_column)
+        quota_merged = _merge_matches(sheet.get("merges") or [], quota_start_column)
+        summary_merged = _merge_matches(sheet.get("merges") or [], summary_start)
         header_matches = (
             str(first[start_column] or "") == bot_name
             and str(second[start_column] or "") == TOTAL_HEADER
@@ -687,8 +945,50 @@ async def sync_daily_stats(
                     [[bot_name, ""], [TOTAL_HEADER, LONG_HEADER]],
                 )
         if not merged:
+            await client.merge_cells(stats.spreadsheet_token, f"{stats.sheet_id}!{left}1:{right}1")
+
+        quota_title = f"{bot_name}{QUOTA_GROUP_SUFFIX}"
+        quota_header_matches = (
+            str(first[quota_start_column] or "") == quota_title
+            and str(second[quota_start_column] or "") == REMAINING_HEADER
+            and str(second[quota_start_column + 1] or "") == DAILY_USAGE_HEADER
+        )
+        if not quota_header_matches:
+            if quota_merged:
+                await client.batch_write_values(
+                    stats.spreadsheet_token,
+                    [
+                        {
+                            "range": f"{stats.sheet_id}!{quota_left}1:{quota_left}1",
+                            "values": [[quota_title]],
+                        },
+                        {
+                            "range": f"{stats.sheet_id}!{quota_left}2:{quota_right}2",
+                            "values": [[REMAINING_HEADER, DAILY_USAGE_HEADER]],
+                        },
+                    ],
+                )
+            else:
+                await client.write_values(
+                    stats.spreadsheet_token,
+                    f"{stats.sheet_id}!{quota_left}1:{quota_right}2",
+                    [[quota_title, ""], [REMAINING_HEADER, DAILY_USAGE_HEADER]],
+                )
+        if not quota_merged:
             await client.merge_cells(
-                stats.spreadsheet_token, f"{stats.sheet_id}!{left}1:{right}1"
+                stats.spreadsheet_token, f"{stats.sheet_id}!{quota_left}1:{quota_right}1"
+            )
+
+        if summary_missing:
+            await client.write_values(
+                stats.spreadsheet_token,
+                f"{stats.sheet_id}!{summary_left}1:{summary_right}2",
+                [[SUMMARY_HEADER, ""], [TOTAL_HEADER, LONG_HEADER]],
+            )
+        if not summary_merged:
+            await client.merge_cells(
+                stats.spreadsheet_token,
+                f"{stats.sheet_id}!{summary_left}1:{summary_right}1",
             )
 
         # Insert older target first.  If both dates are absent this preserves
@@ -705,8 +1005,7 @@ async def sync_daily_stats(
             )
             refreshed = await client.sheet_info(stats.spreadsheet_token, stats.sheet_id)
             current_row_count = int(
-                (refreshed.get("grid_properties") or {}).get("row_count")
-                or current_row_count
+                (refreshed.get("grid_properties") or {}).get("row_count") or current_row_count
             )
         # Re-read because inserting one target can shift the other target.
         date_values = await client.values(
@@ -725,12 +1024,25 @@ async def sync_daily_stats(
                     "values": [[count.total, count.long]],
                 }
             )
+        for day, remaining, used in quota_cells:
+            row_number = rows.get(day)
+            if not row_number:
+                raise DailyStatsError(f"date row disappeared during quota sync: {day}")
+            value_ranges.append(
+                {
+                    "range": f"{stats.sheet_id}!{quota_left}{row_number}:{quota_right}{row_number}",
+                    "values": [[remaining, used]],
+                }
+            )
+        value_ranges.extend(summary_value_ranges(stats.sheet_id, rows, summary_start, column_count))
         # Always perform an idempotent write.  A successful call verifies the
         # app's sheet-write API scope and document edit permission.
         await client.batch_write_values(stats.spreadsheet_token, value_ranges)
 
         sheet_after = await client.sheet_info(stats.spreadsheet_token, stats.sheet_id)
-        after_row_count = int((sheet_after.get("grid_properties") or {}).get("row_count") or row_count)
+        after_row_count = int(
+            (sheet_after.get("grid_properties") or {}).get("row_count") or row_count
+        )
         after_values = await client.values(
             stats.spreadsheet_token,
             f"{stats.sheet_id}!A1:{compare_end}{after_row_count}",
@@ -744,33 +1056,56 @@ async def sync_daily_stats(
                     f"another robot's history changed while syncing {existing_day}"
                 )
 
-        verification_header = await client.values(
-            stats.spreadsheet_token, f"{stats.sheet_id}!{left}1:{right}2"
-        )
-        verify_first = _padded_row(verification_header, 0, 2)
-        verify_second = _padded_row(verification_header, 1, 2)
+        verify_first = _padded_row(after_values, 0, compare_width)
+        verify_second = _padded_row(after_values, 1, compare_width)
         if not (
-            str(verify_first[0] or "") == bot_name
-            and str(verify_second[0] or "") == TOTAL_HEADER
-            and str(verify_second[1] or "") == LONG_HEADER
+            str(verify_first[start_column] or "") == bot_name
+            and str(verify_second[start_column] or "") == TOTAL_HEADER
+            and str(verify_second[start_column + 1] or "") == LONG_HEADER
             and _merge_matches(sheet_after.get("merges") or [], start_column)
         ):
             raise DailyStatsError("bot column group verification failed")
+        if not (
+            str(verify_first[quota_start_column] or "") == quota_title
+            and str(verify_second[quota_start_column] or "") == REMAINING_HEADER
+            and str(verify_second[quota_start_column + 1] or "") == DAILY_USAGE_HEADER
+            and _merge_matches(sheet_after.get("merges") or [], quota_start_column)
+        ):
+            raise DailyStatsError("quota column group verification failed")
+        if not (
+            str(verify_first[summary_start] or "") == SUMMARY_HEADER
+            and str(verify_second[summary_start] or "") == TOTAL_HEADER
+            and str(verify_second[summary_start + 1] or "") == LONG_HEADER
+            and _merge_matches(sheet_after.get("merges") or [], summary_start)
+        ):
+            raise DailyStatsError("summary column group verification failed")
         for count in counts:
             row_number = rows[count.day]
-            values = await client.values(
-                stats.spreadsheet_token,
-                f"{stats.sheet_id}!{left}{row_number}:{right}{row_number}",
-            )
-            row = _padded_row(values, 0, 2)
-            if row[:2] != [count.total, count.long]:
+            row = _padded_row(after_values, row_number - 1, compare_width)
+            if row[start_column : start_column + 2] != [count.total, count.long]:
                 raise DailyStatsError(f"daily values verification failed for {count.day}")
+        for day, remaining, used in quota_cells:
+            row_number = rows[day]
+            row = _padded_row(after_values, row_number - 1, compare_width)
+            quota_values = row[quota_start_column : quota_start_column + 2]
+            if [value or "" for value in quota_values] != [remaining, used]:
+                raise DailyStatsError(f"daily quota verification failed for {day}")
+        for day, row_number in rows.items():
+            row = _padded_row(after_values, row_number - 1, compare_width)
+            for offset, header in enumerate((TOTAL_HEADER, LONG_HEADER)):
+                expected = summary_formula(row_number, summary_start, column_count, header)
+                if str(row[summary_start + offset] or "").lstrip("=") != expected[1:]:
+                    raise DailyStatsError(f"daily summary verification failed for {day}")
 
-    _save_identity(identity_path, identity, start_column, config)
+    _save_identity(identity_path, identity, start_column, quota_start_column, config)
     return SyncResult(
         identity=identity,
         column_start_index=start_column,
+        quota_column_start_index=quota_start_column,
+        summary_column_start_index=summary_start,
+        summary_row_count=len(rows),
         counts=counts,
+        quota_cells=quota_cells,
         sheet_title=str(sheet.get("title") or stats.sheet_id),
         read_verified=True,
         write_verified=True,

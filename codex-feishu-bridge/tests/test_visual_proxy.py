@@ -101,9 +101,7 @@ def test_cache_identity_includes_source_metadata_and_proxy_settings(tmp_path: Pa
 
 def test_visual_proxy_store_has_simple_create_interface(tmp_path: Path) -> None:
     source = _rgb_source(tmp_path / "source.png")
-    path = VisualProxyStore(tmp_path / "proxies", max_edge=512, quality=70).create(
-        source
-    )
+    path = VisualProxyStore(tmp_path / "proxies", max_edge=512, quality=70).create(source)
     assert path.is_file()
     with Image.open(path) as image:
         assert image.format == "JPEG"
@@ -190,9 +188,7 @@ def test_namespaced_exec_is_guarded_and_managed_proxy_is_reused(
         "const inspect = tools.view_image; inspect({path: 'safe.png'})",
     ],
 )
-def test_exec_hook_denies_indirect_view_image_references(
-    tmp_path: Path, source: str
-) -> None:
+def test_exec_hook_denies_indirect_view_image_references(tmp_path: Path, source: str) -> None:
     response = process_hook_event(
         {"tool_name": "exec", "cwd": str(tmp_path), "tool_input": source},
         proxy_root=tmp_path / "proxies",
@@ -212,9 +208,7 @@ def test_exec_hook_denies_indirect_view_image_references(
         "tools.view_image({path: 'safe.png'}, dynamicInput)",
     ],
 )
-def test_exec_hook_denies_dynamic_or_unparseable_image_paths(
-    tmp_path: Path, source: str
-) -> None:
+def test_exec_hook_denies_dynamic_or_unparseable_image_paths(tmp_path: Path, source: str) -> None:
     response = process_hook_event(
         {"tool_name": "exec", "cwd": str(tmp_path), "tool_input": source},
         proxy_root=tmp_path / "proxies",

@@ -13,7 +13,6 @@ from codex_feishu_bridge.heartbeat import (
     validate_ping_url,
 )
 
-
 HOST_URL = "https://hc-ping.com/11111111-2222-3333-4444-555555555555"
 BRIDGE_URL = "https://hc-ping.com/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 

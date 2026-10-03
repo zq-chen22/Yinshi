@@ -5,8 +5,8 @@ from codex_feishu_bridge.models import (
     Attachment,
     IncomingMessage,
     OutboxItem,
-    PendingArtifact,
     PendingApproval,
+    PendingArtifact,
     ThreadSummary,
     TurnJob,
 )
@@ -87,7 +87,7 @@ def thread(
         thread_id=thread_id,
         name=name,
         preview=preview,
-        cwd="/home/test/work",
+        cwd="/workspace/test",
         created_at=10,
         updated_at=updated_at,
         source_kind="cli",
@@ -449,13 +449,9 @@ def test_api_usage_is_aggregated_by_month_and_operation(tmp_path):
     db = BridgeDB(tmp_path / "bridge.sqlite")
     try:
         db.record_api_attempt("conversation", "message.history.list")
-        db.record_api_result(
-            "conversation", "message.history.list", success=True
-        )
+        db.record_api_result("conversation", "message.history.list", success=True)
         db.record_api_attempt("conversation", "message.history.list")
-        db.record_api_result(
-            "conversation", "message.history.list", success=False
-        )
+        db.record_api_result("conversation", "message.history.list", success=False)
         db.record_api_attempt("conversation", "message.card.patch")
 
         assert db.api_usage() == {
@@ -487,5 +483,56 @@ def test_artifact_requires_chat_scoped_second_approval(tmp_path):
         assert db.get_artifact_approval("artifact-token", "oc-expected") == artifact
         assert db.resolve_artifact_approval("artifact-token", "approved") is True
         assert db.resolve_artifact_approval("artifact-token", "approved") is False
+    finally:
+        db.close()
+
+
+def test_retention_prunes_only_terminal_private_payloads(tmp_path):
+    db = BridgeDB(tmp_path / "bridge.sqlite")
+    done = IncomingMessage(
+        message_id="om-expired",
+        chat_id="oc-chat",
+        chat_type="group",
+        app_role="conversation",
+        sender_open_id="ou-owner",
+        sender_user_id="user-owner",
+        sender_union_id="union-owner",
+        text="private message body",
+        message_type="text",
+        create_time_ms=1,
+    )
+    pending = IncomingMessage(
+        message_id="om-pending",
+        chat_id="oc-chat",
+        chat_type="group",
+        app_role="conversation",
+        sender_open_id="ou-owner",
+        sender_user_id="user-owner",
+        sender_union_id="union-owner",
+        text="still needed",
+        message_type="text",
+        create_time_ms=2,
+    )
+    try:
+        assert db.enqueue_incoming(done)
+        assert db.claim_incoming("worker") is not None
+        db.complete_incoming(done.message_id)
+        assert db.enqueue_incoming(pending)
+        with db._lock:
+            db._conn.execute(
+                "UPDATE inbox_messages SET updated_at=1 WHERE message_id=?",
+                (done.message_id,),
+            )
+            db._conn.execute(
+                "UPDATE inbox_messages SET updated_at=1 WHERE message_id=?",
+                (pending.message_id,),
+            )
+            db._conn.commit()
+
+        removed = db.prune_retained_data(30, now=4_000_000)
+
+        assert removed["inbox_messages"] == 1
+        assert db.inbox_state(done.message_id) is None
+        assert db.inbox_state(pending.message_id) == "pending"
     finally:
         db.close()

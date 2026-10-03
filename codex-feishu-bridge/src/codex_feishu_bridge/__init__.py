@@ -1,3 +1,3 @@
-"""Feishu control plane for local Codex conversations."""
+"""Feixing Bridge: a local Feishu control plane for Codex conversations."""
 
-__version__ = "0.2.0"
+__version__ = "0.4.0"

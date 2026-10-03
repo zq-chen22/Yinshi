@@ -16,14 +16,16 @@ import os
 import re
 import secrets
 import shlex
-import subprocess
+
+# Used only for ``list2cmdline`` quoting on Windows; no process is started here.
+import subprocess  # nosec B404
 import sys
+from collections.abc import Mapping
 from dataclasses import KW_ONLY, dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 from PIL import Image, ImageOps
-
 
 DEFAULT_MAX_EDGE = 1024
 DEFAULT_JPEG_QUALITY = 75
@@ -98,11 +100,16 @@ def proxy_cache_key(
     _validate_settings(max_edge, quality)
     canonical = source.expanduser().resolve(strict=True)
     metadata = canonical.stat()
+    digest = hashlib.sha256()
+    with canonical.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
     material = {
         "format_version": PROXY_FORMAT_VERSION,
         "source": str(canonical),
         "size": metadata.st_size,
         "mtime_ns": metadata.st_mtime_ns,
+        "source_sha256": digest.hexdigest(),
         "max_edge": max_edge,
         "quality": quality,
         "background": list(_BACKGROUND),
@@ -185,9 +192,7 @@ def make_image_proxy(
             source_size = ImageOps.exif_transpose(source_image).size
         return ProxyResult(canonical, destination, source_size, output_size, True)
 
-    temporary = shard / (
-        f".{digest}.tmp-{os.getpid()}-{secrets.token_hex(6)}.jpg"
-    )
+    temporary = shard / (f".{digest}.tmp-{os.getpid()}-{secrets.token_hex(6)}.jpg")
     try:
         with Image.open(canonical) as opened:
             image = ImageOps.exif_transpose(opened)
@@ -448,11 +453,7 @@ def _rewrite_one_exec_call(
         quality=quality,
     )
 
-    safe_object = (
-        '{"path": '
-        + json.dumps(str(safe_path))
-        + ', "detail": "high"}'
-    )
+    safe_object = '{"path": ' + json.dumps(str(safe_path)) + ', "detail": "high"}'
     return call_source[:index] + safe_object + call_source[close_brace + 1 :]
 
 
@@ -470,9 +471,7 @@ def rewrite_exec_source(
     matches = list(_VIEW_IMAGE_CALL.finditer(source))
     references = list(_VIEW_IMAGE_REFERENCE.finditer(source))
     if len(references) != len(matches):
-        raise ProxyError(
-            "only direct static tools.view_image({...}) calls are permitted"
-        )
+        raise ProxyError("only direct static tools.view_image({...}) calls are permitted")
     if not matches:
         return source, 0
     rewritten = source
@@ -585,11 +584,7 @@ def process_hook_event(
         or tool_name.endswith("__view_image")
         or tool_name.endswith(".view_image")
     )
-    is_exec = (
-        tool_name == "exec"
-        or tool_name.endswith("__exec")
-        or tool_name.endswith(".exec")
-    )
+    is_exec = tool_name == "exec" or tool_name.endswith("__exec") or tool_name.endswith(".exec")
     if not is_view and not is_exec:
         return None
     cwd_value = event.get("cwd")
@@ -654,9 +649,7 @@ def build_codex_hook_config(
         "--quality",
         str(quality),
     ]
-    command = (
-        subprocess.list2cmdline(arguments) if os.name == "nt" else shlex.join(arguments)
-    )
+    command = subprocess.list2cmdline(arguments) if os.name == "nt" else shlex.join(arguments)
     return {
         "bypass_hook_trust": True,
         "hooks.PreToolUse": [

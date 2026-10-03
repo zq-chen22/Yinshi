@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from io import BytesIO
 from pathlib import Path
 
 import pytest
@@ -7,6 +8,7 @@ from PIL import Image
 
 from codex_feishu_bridge.artifacts import ArtifactBroker, ArtifactError
 from codex_feishu_bridge.config import BridgeConfig
+from codex_feishu_bridge.feishu import _normalize_message_content
 from codex_feishu_bridge.models import Attachment, IncomingMessage
 
 
@@ -114,6 +116,39 @@ async def test_prepare_inputs_exposes_proxy_but_keeps_non_image_attachment_path(
     assert all(item.get("path") != str(image.resolve()) for item in inputs)
     descriptions = [item["text"] for item in inputs if item["type"] == "text"]
     assert any(str(document.resolve()) in text for text in descriptions)
+
+
+@pytest.mark.asyncio
+async def test_post_file_backed_image_becomes_a_safe_local_image_input(tmp_path: Path) -> None:
+    config = bridge_config(tmp_path)
+    buffer = BytesIO()
+    Image.new("RGB", (1280, 1707), (31, 63, 95)).save(buffer, format="JPEG")
+    text, attachments = _normalize_message_content(
+        "om-image",
+        "post",
+        {
+            "title": "",
+            "content": [[{"tag": "text", "text": "请看图片"}]],
+            "content_v2": [[{"tag": "text", "text": "请看图片"}]],
+            "files": [{"file_key": "file-photo", "file_name": "photo.jpg", "is_folder": False}],
+        },
+    )
+    message = incoming_message(*attachments)
+    message.text = text
+    broker = ArtifactBroker(config, FakeGateway(buffer.getvalue()))
+
+    inputs = await broker.prepare_inputs(message)
+
+    images = [item for item in inputs if item["type"] == "localImage"]
+    assert len(images) == 1
+    proxy = Path(images[0]["path"])
+    assert proxy.is_relative_to(config.visual_proxy_dir)
+    assert attachments[0].local_path != proxy
+    with Image.open(proxy) as decoded:
+        assert decoded.format == "JPEG"
+        assert max(decoded.size) <= config.image_proxy_max_edge
+    assert inputs[0]["text"] == "请看图片"
+    assert all(str(attachments[0].local_path) not in item.get("text", "") for item in inputs)
 
 
 @pytest.mark.asyncio

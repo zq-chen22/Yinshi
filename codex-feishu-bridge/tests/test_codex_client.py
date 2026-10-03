@@ -9,11 +9,11 @@ import pytest
 from codex_feishu_bridge.codex_client import (
     CodexAppServer,
     extract_agent_messages,
+    extract_user_messages,
     latest_final_from_thread,
 )
 
-
-FAKE_CODEX = r'''#!/usr/bin/env python3
+FAKE_CODEX = r"""#!/usr/bin/env python3
 import json
 import sys
 
@@ -153,7 +153,7 @@ for raw in sys.stdin:
         send({"id": request_id, "result": {}})
     else:
         send({"id": request_id, "result": {}})
-'''
+"""
 
 
 def make_fake_codex(tmp_path):
@@ -219,9 +219,7 @@ async def test_jsonl_client_filters_threads_and_dispatches_events(tmp_path):
             "hooks.PreToolUse": [{"matcher": "view_image", "hooks": []}],
         }
         client.configure_thread_defaults(config_overrides=hook_config)
-        resumed = await client.resume_thread(
-            "thread-1", cwd="/work/migrated", exclude_turns=True
-        )
+        resumed = await client.resume_thread("thread-1", cwd="/work/migrated", exclude_turns=True)
         assert resumed["received"]["cwd"] == "/work/migrated"
         assert resumed["received"]["config"] == hook_config
         started = await client.start_thread(
@@ -312,15 +310,30 @@ def test_agent_message_extractors_prefer_final_answer():
     assert latest_final_from_thread({"turns": [turn]}) == ("turn-1", "已完成")
 
 
+def test_user_message_extractor_reads_text_content_only():
+    turn = {
+        "items": [
+            {
+                "type": "userMessage",
+                "content": [
+                    {"type": "text", "text": "请检查测试"},
+                    {"type": "image", "url": "file:///tmp/private.png"},
+                ],
+            },
+            {"type": "agentMessage", "phase": "commentary", "text": "处理中"},
+        ]
+    }
+
+    assert extract_user_messages(turn) == ["请检查测试"]
+
+
 def test_latest_message_falls_back_to_completed_commentary():
     thread = {
         "turns": [
             {
                 "id": "turn-2",
                 "status": "failed",
-                "items": [
-                    {"type": "agentMessage", "phase": "commentary", "text": "执行失败"}
-                ],
+                "items": [{"type": "agentMessage", "phase": "commentary", "text": "执行失败"}],
             }
         ]
     }

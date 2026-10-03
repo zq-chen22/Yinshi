@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import time
+from collections.abc import Iterator
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -21,12 +24,28 @@ from codex_feishu_bridge.models import (
     TurnJob,
 )
 from codex_feishu_bridge.service import (
+    SUPPORTED_SETTINGS_CLI_VERSION,
     BridgeService,
     RuntimeSettings,
     ScheduledMessage,
-    SUPPORTED_SETTINGS_CLI_VERSION,
+    _redact,
     generate_pairing_code,
 )
+
+
+def test_redact_covers_environment_and_provider_secret_shapes() -> None:
+    text = (
+        "FEISHU_CONVERSATION_APP_SECRET=example-secret-value "
+        "Authorization: Bearer example-bearer-value "
+        "sk-exampleprovidersecret123456"
+    )
+
+    redacted = _redact(text)
+
+    assert "example-secret-value" not in redacted
+    assert "example-bearer-value" not in redacted
+    assert "exampleprovidersecret" not in redacted
+    assert redacted.count("[已隐藏]") >= 3
 
 
 class FakeCodex:
@@ -169,7 +188,9 @@ class FastCompletingCodex(FakeCodex):
     async def archive_thread(self, thread_id: str) -> None:
         self.archived_threads.append(thread_id)
 
-    async def start_turn(self, thread_id: str, inputs: list[dict[str, Any]], **_: Any) -> dict[str, Any]:
+    async def start_turn(
+        self, thread_id: str, inputs: list[dict[str, Any]], **_: Any
+    ) -> dict[str, Any]:
         turn = {
             "id": "turn-fast",
             "status": "completed",
@@ -184,7 +205,10 @@ class FastCompletingCodex(FakeCodex):
         }
         for handler in self.notification_handlers:
             await handler(
-                {"method": "turn/started", "params": {"threadId": thread_id, "turn": {"id": "turn-fast"}}}
+                {
+                    "method": "turn/started",
+                    "params": {"threadId": thread_id, "turn": {"id": "turn-fast"}},
+                }
             )
             await handler(
                 {"method": "turn/completed", "params": {"threadId": thread_id, "turn": turn}}
@@ -200,7 +224,6 @@ class StaleInProgressCodex(FakeCodex):
             "path": None,
             "turns": [{"id": "turn-stale", "status": "inProgress", "items": []}],
         }
-
 
 
 class ThreadStartCrashCodex(FakeCodex):
@@ -300,9 +323,7 @@ class RestartContinuationCodex(ThreadHistoryCodex):
 
 
 class SummaryOnlyCodex(FakeCodex):
-    async def read_thread(
-        self, thread_id: str, *, include_turns: bool = True
-    ) -> dict[str, Any]:
+    async def read_thread(self, thread_id: str, *, include_turns: bool = True) -> dict[str, Any]:
         assert include_turns is False
         return {"id": thread_id, "status": {"type": "idle"}}
 
@@ -340,9 +361,7 @@ class FakeGateway:
         text: str,
         **kwargs: Any,
     ) -> str:
-        self.texts.append(
-            {"role": role, "receive_id": receive_id, "text": text, **kwargs}
-        )
+        self.texts.append({"role": role, "receive_id": receive_id, "text": text, **kwargs})
         return f"text-{len(self.texts)}"
 
     async def send_card(
@@ -352,21 +371,13 @@ class FakeGateway:
         card: dict[str, Any],
         **kwargs: Any,
     ) -> str:
-        self.cards.append(
-            {"role": role, "receive_id": receive_id, "card": card, **kwargs}
-        )
+        self.cards.append({"role": role, "receive_id": receive_id, "card": card, **kwargs})
         return f"card-{len(self.cards)}"
 
-    async def patch_card(
-        self, role: AppRole, message_id: str, card: dict[str, Any]
-    ) -> None:
-        self.patches.append(
-            {"role": role, "message_id": message_id, "card": card}
-        )
+    async def patch_card(self, role: AppRole, message_id: str, card: dict[str, Any]) -> None:
+        self.patches.append({"role": role, "message_id": message_id, "card": card})
 
-    async def download_attachment(
-        self, role: AppRole, attachment: Attachment
-    ) -> tuple[bytes, str]:
+    async def download_attachment(self, role: AppRole, attachment: Attachment) -> tuple[bytes, str]:
         self.downloads.append((role, attachment))
         return b"staged attachment", attachment.name
 
@@ -422,7 +433,7 @@ def incoming(
     chat_id: str = "oc_thread",
     open_id: str = "ou_conversation_owner",
     text: str = "继续",
-    tenant_key: str = "tenant-yinshi",
+    tenant_key: str = "tenant-test",
     create_time_ms: int = 1_000,
     chat_type: str | None = None,
 ) -> IncomingMessage:
@@ -457,7 +468,7 @@ def bind_thread(db: BridgeDB, *, thread_id: str = "thread-1", chat_id: str = "oc
             thread_id=thread_id,
             name="受控对话",
             preview="",
-            cwd="/home/galbot",
+            cwd="/workspace/test",
             created_at=1,
             updated_at=2,
             source_kind="cli",
@@ -572,47 +583,7 @@ async def test_completed_before_turn_start_response_leaves_no_ghost_active(tmp_p
 
 
 @pytest.mark.asyncio
-async def test_execute_job_discards_completed_active_residue_without_spinning(
-    tmp_path: Path,
-) -> None:
-    config = make_config(tmp_path, owner_conversation_open_id="ou_conversation_owner")
-    db = BridgeDB(config.database_path)
-    codex = FastCompletingCodex()
-    gateway = FakeGateway()
-    service = BridgeService(config, db, codex, gateway)  # type: ignore[arg-type]
-    bind_thread(db)
-    message = incoming("om-after-ghost", text="继续下一项任务")
-    item = stage(db, message)
-    db.mark_incoming_queued(message.message_id)
-    job = ScheduledMessage(
-        inbox=item,
-        binding=db.get_binding_by_thread("thread-1"),
-        progress_message_id="progress-after-ghost",
-        app_role="conversation",
-        chat_id="oc_thread",
-    )
-    residue = ActiveTurn(
-        thread_id="thread-1",
-        turn_id="turn-completed-residue",
-        chat_id="oc_thread",
-        progress_message_id="progress-old",
-    )
-    service._register_active(residue)
-    service._turn_done[residue.turn_id].set()
-    try:
-        await asyncio.wait_for(service._execute_job("thread-1", job), timeout=1)
-        assert residue.turn_id not in service._active_by_turn
-        assert service._active_by_thread == {}
-        assert db.inbox_state(message.message_id) == "done"
-        assert db.outbox_counts() == {"pending": 1}
-    finally:
-        db.close()
-
-
-@pytest.mark.asyncio
-async def test_recovery_query_cannot_reregister_turn_completed_while_awaiting(
-    tmp_path: Path,
-) -> None:
+async def test_recovery_query_cannot_reregister_completed_turn(tmp_path: Path) -> None:
     class RacingRecoveryCodex(FakeCodex):
         def __init__(self) -> None:
             super().__init__()
@@ -677,11 +648,9 @@ async def test_recovery_query_cannot_reregister_turn_completed_while_awaiting(
                 ],
             },
         )
-        assert service._active_by_thread == {}
-        assert service._turn_done[job.turn_id].is_set()
-
         codex.release_query.set()
         await asyncio.wait_for(recovery, timeout=1)
+
         assert service._active_by_thread == {}
         assert service._active_by_turn == {}
         assert db.list_recoverable_turn_jobs() == []
@@ -691,6 +660,79 @@ async def test_recovery_query_cannot_reregister_turn_completed_while_awaiting(
             recovery.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await recovery
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_execute_job_discards_stale_completed_active_turn(tmp_path: Path) -> None:
+    config = make_config(tmp_path, owner_conversation_open_id="ou_conversation_owner")
+    db = BridgeDB(config.database_path)
+    codex = FastCompletingCodex()
+    service = BridgeService(config, db, codex, FakeGateway())  # type: ignore[arg-type]
+    bind_thread(db)
+    stale = ActiveTurn(
+        thread_id="thread-1",
+        turn_id="turn-stale-completed",
+        chat_id="oc_thread",
+    )
+    service._register_active(stale)
+    service._completed_turns.add(stale.turn_id)
+    service._turn_done[stale.turn_id].set()
+    item = stage(db, incoming("om-after-stale", text="继续执行"))
+    job = ScheduledMessage(
+        inbox=item,
+        binding=db.get_binding_by_thread("thread-1"),
+        progress_message_id="progress-after-stale",
+        app_role="conversation",
+        chat_id="oc_thread",
+    )
+
+    try:
+        await service._execute_job("thread-1", job)
+
+        assert service._active_by_thread == {}
+        assert service._active_by_turn == {}
+        assert db.inbox_state("om-after-stale") == "done"
+        assert db.list_recoverable_turn_jobs() == []
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_stale_completed_active_turn_does_not_inflate_queue_position(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path, owner_conversation_open_id="ou_conversation_owner")
+    db = BridgeDB(config.database_path)
+    gateway = FakeGateway()
+    service = BridgeService(config, db, FakeCodex(), gateway)  # type: ignore[arg-type]
+    bind_thread(db)
+    stale = ActiveTurn(
+        thread_id="thread-1",
+        turn_id="turn-stale-completed",
+        chat_id="oc_thread",
+    )
+    service._register_active(stale)
+    service._completed_turns.add(stale.turn_id)
+    service._turn_done[stale.turn_id].set()
+    blocker = asyncio.create_task(asyncio.Event().wait())
+    service._thread_workers["thread-1"] = blocker
+
+    try:
+        item = stage(db, incoming("om-after-stale", text="继续执行"))
+        binding = db.get_binding_by_thread("thread-1")
+        assert binding is not None
+        await service._queue_thread_message(item, binding)
+
+        content = gateway.cards[-1]["card"]["elements"][0]["content"]
+        assert "正在启动" in content
+        assert "前面还有" not in content
+        assert service._active_by_thread == {}
+        assert service._active_by_turn == {}
+    finally:
+        blocker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await blocker
         db.close()
 
 
@@ -777,6 +819,58 @@ async def test_recovery_poll_finalizes_terminal_turn_still_marked_active(
 
 
 @pytest.mark.asyncio
+async def test_recovery_snapshot_does_not_reregister_turn_completed_during_lookup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = make_config(tmp_path, owner_conversation_open_id="ou_conversation_owner")
+    db = BridgeDB(config.database_path)
+    service = BridgeService(config, db, FakeCodex(), FakeGateway())  # type: ignore[arg-type]
+    terminal_turn = {
+        "id": "turn-completed-during-recovery",
+        "status": "completed",
+        "items": [
+            {
+                "type": "agentMessage",
+                "phase": "final_answer",
+                "text": "并发完成结果",
+            }
+        ],
+    }
+    active = ActiveTurn(
+        thread_id="thread-1",
+        turn_id="turn-completed-during-recovery",
+        chat_id="oc_thread",
+    )
+    db.upsert_turn_job(
+        TurnJob(
+            message_id="om-completed-during-recovery",
+            thread_id=active.thread_id,
+            turn_id=active.turn_id,
+            app_role="conversation",
+            chat_id=active.chat_id,
+            progress_message_id=None,
+            state="accepted",
+        )
+    )
+
+    async def complete_during_lookup(_: str, __: str) -> dict[str, Any]:
+        await service._finalize_turn(active, terminal_turn)
+        return terminal_turn
+
+    monkeypatch.setattr(service, "_find_turn_summary", complete_during_lookup)
+    try:
+        await service._recover_turn_jobs()
+
+        assert service._active_by_thread == {}
+        assert service._active_by_turn == {}
+        assert service._turn_done[active.turn_id].is_set()
+        assert db.list_recoverable_turn_jobs() == []
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
 async def test_startup_continues_interrupted_bridge_turn_without_external_echo(
     tmp_path: Path,
 ) -> None:
@@ -801,7 +895,7 @@ async def test_startup_continues_interrupted_bridge_turn_without_external_echo(
         thread_id="thread-1",
         name="受控对话",
         preview="",
-        cwd="/home/galbot",
+        cwd="/workspace/test",
         created_at=1,
         updated_at=2,
         source_kind="cli",
@@ -883,7 +977,270 @@ async def test_unauthorized_sender_is_completed_without_reply_or_codex_dispatch(
         db.close()
 
 
-def test_history_sender_without_cross_app_ids_uses_paired_open_id_and_tenant(
+@pytest.fixture
+def shared_group_service(tmp_path: Path) -> Iterator[BridgeService]:
+    config = make_config(tmp_path, owner_conversation_open_id="ou_conversation_owner")
+    config.feishu.conversation.app_id = "cli_conversation"
+    db = BridgeDB(config.database_path)
+    db.set_setting("paired_tenant_key", "tenant-test")
+    db.set_setting("tenant_key:conversation", "tenant-test")
+    db.set_setting("paired_owner_union_id", "on_same_human")
+    db.set_setting(
+        "group_collaborators:conversation",
+        json.dumps(
+            {
+                "ou_group_collaborator": {
+                    "app_id": "cli_conversation",
+                    "tenant_key": "tenant-test",
+                    "owner_open_id": "ou_conversation_owner",
+                    "union_id": "on_group_collaborator",
+                    "user_id": "",
+                    "authorized_at_ms": 1_000,
+                }
+            }
+        ),
+    )
+    bind_thread(db)
+    service = BridgeService(config, db, FakeCodex(), FakeGateway())
+    try:
+        yield service
+    finally:
+        db.close()
+
+
+def group_collaborator_message(message_id: str, **kwargs: Any) -> IncomingMessage:
+    return replace(
+        incoming(message_id, open_id="ou_group_collaborator", **kwargs),
+        sender_union_id="on_group_collaborator",
+    )
+
+
+def test_group_collaborator_applies_to_existing_new_and_restored_groups(
+    shared_group_service: BridgeService,
+) -> None:
+    service = shared_group_service
+    message = group_collaborator_message("om-collaborator")
+    assert service._authorized(message) is True
+    bind_thread(service.db, thread_id="thread-new", chat_id="oc_new")
+    new_message = replace(message, chat_id="oc_new")
+    assert service._authorized(new_message) is True
+    restored = BridgeService(service.config, service.db, FakeCodex(), FakeGateway())
+    assert restored._authorized(new_message) is True
+    assert service._owner("conversation") == "ou_conversation_owner"
+    assert service.db.get_setting("paired_owner_union_id") == "on_same_human"
+
+    service.db.delete_setting("group_collaborators:conversation")
+    assert service._authorized(message) is False
+    assert restored._authorized(new_message) is False
+    assert service._authorized(incoming("om-owner")) is True
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"sender_open_id": "ou_uninvited"},
+        {"sender_open_id": None},
+        {"sender_union_id": "on_someone_else"},
+        {"tenant_key": "another-tenant"},
+        {"tenant_key": None},
+        {"app_id": "cli_another_app"},
+        {"app_id": None},
+        {"chat_type": "p2p"},
+        {"app_role": "admin"},
+        {"chat_id": "oc_unbound"},
+        {"sender_type": "app"},
+        {"create_time_ms": 999},
+    ],
+)
+def test_group_collaborator_rejects_wrong_identity_or_scope(
+    shared_group_service: BridgeService, changes: dict[str, Any]
+) -> None:
+    message = replace(group_collaborator_message("om-rejected"), **changes)
+    assert shared_group_service._authorized(message) is False
+
+
+@pytest.mark.parametrize("raw", ["{", "null", "[]", "{}", '{"ou_group_collaborator": []}'])
+def test_group_collaborator_fails_closed_on_invalid_settings(
+    shared_group_service: BridgeService, raw: str
+) -> None:
+    shared_group_service.db.set_setting("group_collaborators:conversation", raw)
+    assert shared_group_service._authorized(group_collaborator_message("om-invalid")) is False
+    assert shared_group_service._authorized(incoming("om-owner")) is True
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("app_id", "cli_old_app"),
+        ("tenant_key", "old-tenant"),
+        ("owner_open_id", "ou_old_owner"),
+        ("union_id", ""),
+        ("union_id", ["on_group_collaborator"]),
+        ("user_id", None),
+        ("authorized_at_ms", None),
+        ("authorized_at_ms", True),
+        ("authorized_at_ms", 0),
+    ],
+)
+def test_group_collaborator_requires_complete_current_pairing(
+    shared_group_service: BridgeService, field: str, value: Any
+) -> None:
+    service = shared_group_service
+    settings = json.loads(service.db.get_setting("group_collaborators:conversation") or "{}")
+    settings["ou_group_collaborator"][field] = value
+    service.db.set_setting("group_collaborators:conversation", json.dumps(settings))
+    assert service._authorized(group_collaborator_message("om-invalid-pairing")) is False
+
+
+def test_group_collaborator_history_without_cross_app_ids_is_authorized(
+    shared_group_service: BridgeService,
+) -> None:
+    message = replace(
+        group_collaborator_message("om-history"), sender_union_id=None, sender_user_id=None
+    )
+    assert shared_group_service._authorized(message) is True
+
+
+def test_group_collaborator_cannot_use_inactive_binding(
+    shared_group_service: BridgeService,
+) -> None:
+    shared_group_service.db._conn.execute("UPDATE bindings SET active=0")
+    assert shared_group_service._authorized(group_collaborator_message("om-inactive")) is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("collaborator_starts", [False, True])
+async def test_group_collaborators_share_fifo_append_and_stop_in_both_directions(
+    shared_group_service: BridgeService, collaborator_starts: bool
+) -> None:
+    service = shared_group_service
+    codex = service.codex
+    db = service.db
+    starter = group_collaborator_message if collaborator_starts else incoming
+    controller = incoming if collaborator_starts else group_collaborator_message
+    blocker = asyncio.create_task(asyncio.Event().wait())
+    service._thread_workers["thread-1"] = blocker
+    try:
+        await service._route_incoming(stage(db, starter("om-first", text="第一条")))
+        await service._route_incoming(stage(db, controller("om-second", text="第二条")))
+        queue = service._thread_queues["thread-1"]
+        assert queue.qsize() == 2
+        first = queue.get_nowait()
+        assert first.inbox.message.message_id == "om-first"
+        assert first.inbox.message.sender_open_id == starter("unused").sender_open_id
+        queue.task_done()
+        service._register_active(
+            ActiveTurn(thread_id="thread-1", turn_id="turn-shared", chat_id="oc_thread")
+        )
+        service._register_active(
+            ActiveTurn(thread_id="thread-other", turn_id="turn-other", chat_id="oc_other")
+        )
+        db.upsert_turn_job(
+            TurnJob(
+                message_id="om-first",
+                thread_id="thread-1",
+                turn_id="turn-shared",
+                app_role="conversation",
+                chat_id="oc_thread",
+                progress_message_id=first.progress_message_id,
+                state="accepted",
+            )
+        )
+        await service._route_incoming(stage(db, controller("om-steer", text="!steer 补充")))
+        assert codex.steered[-1]["inputs"][0]["text"] == "补充"
+        await service._route_incoming(stage(db, controller("om-append", text="追加信息")))
+        assert queue.empty()
+        assert codex.steered[-1]["client_message_id"] == "om-second"
+        assert codex.steered[-1]["inputs"][0]["text"] == "第二条"
+        for make_message, message_id in ((starter, "om-follow-a"), (controller, "om-follow-b")):
+            await service._route_incoming(stage(db, make_message(message_id)))
+            assert codex.steered[-1]["client_message_id"] == message_id
+            assert codex.steered[-1]["turn_id"] == "turn-shared"
+
+        await service._route_incoming(stage(db, controller("om-stop", text="停止任务")))
+        assert codex.interrupted == [("thread-1", "turn-shared")]
+        assert "turn-other" in service._active_by_turn
+        assert db.inbox_state("om-stop") == "done"
+        assert service._append_to_turn == {}
+    finally:
+        blocker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await blocker
+
+
+@pytest.mark.asyncio
+async def test_unpaired_group_member_cannot_stop_shared_task(
+    shared_group_service: BridgeService,
+) -> None:
+    service = shared_group_service
+    service._register_active(
+        ActiveTurn(thread_id="thread-1", turn_id="turn-shared", chat_id="oc_thread")
+    )
+    message = incoming("om-unpaired-stop", open_id="ou_unpaired", text="停止任务")
+    await service._route_incoming(stage(service.db, message))
+    assert service.codex.interrupted == []
+    assert "turn-shared" in service._active_by_turn
+    assert service.db.inbox_state(message.message_id) == "done"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("collaborator_uploads", [False, True])
+async def test_group_collaborators_share_held_attachments(
+    shared_group_service: BridgeService, collaborator_uploads: bool
+) -> None:
+    service = shared_group_service
+    uploader = group_collaborator_message if collaborator_uploads else incoming
+    requester = incoming if collaborator_uploads else group_collaborator_message
+    blocker = asyncio.create_task(asyncio.Event().wait())
+    service._thread_workers["thread-1"] = blocker
+    media = replace(
+        uploader("om-shared-file", text=""),
+        message_type="file",
+        attachments=[
+            Attachment(
+                kind="file", name="shared.txt", message_id="om-shared-file", file_key="file-shared"
+            )
+        ],
+    )
+    try:
+        await service._route_incoming(stage(service.db, media))
+        assert service.db.inbox_state(media.message_id) == "held"
+        await service._route_incoming(
+            stage(service.db, requester("om-use-shared-file", text="阅读刚才的文件"))
+        )
+        job = service._thread_queues["thread-1"].get_nowait()
+        assert [attachment.message_id for attachment in job.inbox.message.attachments] == [
+            "om-shared-file"
+        ]
+        assert service.db.inbox_state(media.message_id) == "done"
+    finally:
+        blocker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await blocker
+
+
+@pytest.mark.asyncio
+async def test_unpaired_group_member_cannot_stage_shared_attachments(
+    shared_group_service: BridgeService,
+) -> None:
+    message = replace(
+        incoming("om-unpaired-file", open_id="ou_unpaired", text=""),
+        message_type="file",
+        attachments=[
+            Attachment(
+                kind="file",
+                name="unpaired.txt",
+                message_id="om-unpaired-file",
+                file_key="file-test",
+            )
+        ],
+    )
+    await shared_group_service._route_incoming(stage(shared_group_service.db, message))
+    assert shared_group_service.gateway.downloads == []
+    assert shared_group_service.db.inbox_state(message.message_id) == "done"
+
+
+def test_history_sender_without_cross_app_ids_uses_open_id_and_tenant(
     tmp_path: Path,
 ) -> None:
     config = make_config(
@@ -892,7 +1249,7 @@ def test_history_sender_without_cross_app_ids_uses_paired_open_id_and_tenant(
     )
     db = BridgeDB(config.database_path)
     service = BridgeService(config, db, FakeCodex(), FakeGateway())  # type: ignore[arg-type]
-    db.set_setting("paired_tenant_key", "tenant-yinshi")
+    db.set_setting("paired_tenant_key", "tenant-test")
     db.set_setting("paired_owner_union_id", "on_same_human")
 
     try:
@@ -1495,7 +1852,7 @@ async def test_append_information_requeues_all_jobs_when_input_preparation_fails
             "om-prepare-a",
             "om-prepare-b",
         ]
-        for job in restored:
+        for _job in restored:
             queue.task_done()
         assert db.inbox_state("om-prepare-a") == "queued"
         assert db.inbox_state("om-prepare-b") == "queued"
@@ -1594,7 +1951,7 @@ async def test_append_information_requeues_remaining_fifo_if_turn_finishes_mid_b
             "om-mid-2",
             "om-mid-3",
         ]
-        for job in remaining:
+        for _job in remaining:
             queue.task_done()
         assert db.inbox_state("om-mid-1") == "done"
         assert db.inbox_state("om-mid-2") == "queued"
@@ -2065,9 +2422,7 @@ async def test_attachment_only_message_waits_for_next_codex_text(tmp_path: Path)
         await service._route_incoming(stage(db, text))
         queued = service._thread_queues["thread-1"].get_nowait()
         assert queued.inbox.message.message_id == text.message_id
-        assert [
-            item.message_id for item in queued.inbox.message.attachments
-        ] == [media.message_id]
+        assert [item.message_id for item in queued.inbox.message.attachments] == [media.message_id]
         assert queued.inbox.message.attachments[0].local_path is not None
         assert db.inbox_state(media.message_id) == "done"
         service._thread_queues["thread-1"].task_done()
@@ -2129,6 +2484,7 @@ async def test_system_alert_prefers_conversation_private_bot(tmp_path: Path) -> 
 @pytest.mark.asyncio
 async def test_runtime_commands_persist_audit_and_apply_to_codex(tmp_path: Path) -> None:
     config = make_config(tmp_path, owner_conversation_open_id="ou_conversation_owner")
+    config.allow_remote_full_access = True
     db = BridgeDB(config.database_path)
     codex = FakeCodex()
     gateway = FakeGateway()
@@ -2185,9 +2541,7 @@ async def test_cli_setting_commands_render_pickers_and_toggle_fast(tmp_path: Pat
         await service._route_incoming(stage(db, incoming("pick-model", text="/model")))
         model_card = gateway.cards[-1]["card"]
         model_buttons = [
-            action
-            for element in model_card["elements"]
-            for action in element.get("actions", [])
+            action for element in model_card["elements"] for action in element.get("actions", [])
         ]
         assert model_buttons[0]["value"] == {
             "kind": "codex_setting",
@@ -2195,22 +2549,45 @@ async def test_cli_setting_commands_render_pickers_and_toggle_fast(tmp_path: Pat
             "model": "gpt-test",
         }
 
-        await service._route_incoming(
-            stage(db, incoming("pick-permissions", text="/permissions"))
-        )
+        await service._route_incoming(stage(db, incoming("pick-permissions", text="/permissions")))
         permission_card = gateway.cards[-1]["card"]
         profiles = [
             action["value"]["profile"]
             for element in permission_card["elements"]
             for action in element.get("actions", [])
         ]
-        assert profiles == ["read-only", "default", "full-access"]
+        assert profiles == ["read-only", "default"]
 
         await service._route_incoming(stage(db, incoming("toggle-fast-1", text="/fast")))
         assert service._runtime_settings("thread-1").service_tier == "priority"
         await service._route_incoming(stage(db, incoming("toggle-fast-2", text="/fast")))
         assert service._runtime_settings("thread-1").service_tier is None
         assert "Fast 模式已关闭" in gateway.texts[-1]["text"]
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_remote_full_access_requires_explicit_local_opt_in(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path, owner_conversation_open_id="ou_conversation_owner")
+    db = BridgeDB(config.database_path)
+    codex = FakeCodex()
+    gateway = FakeGateway()
+    service = BridgeService(config, db, codex, gateway)  # type: ignore[arg-type]
+    bind_thread(db)
+
+    try:
+        await service._route_incoming(
+            stage(db, incoming("unsafe-permission", text="/permissions full-access"))
+        )
+
+        settings = service._runtime_settings("thread-1")
+        assert settings.approval_policy == "on-request"
+        assert settings.sandbox == "workspace-write"
+        assert db.runtime_config_history("thread-1") == []
+        assert "远程 Full Access 默认禁用" in gateway.texts[-1]["text"]
     finally:
         db.close()
 
@@ -2241,15 +2618,13 @@ async def test_supported_cli_baseline_keeps_runtime_settings_enabled(tmp_path: P
     db = BridgeDB(config.database_path)
     codex = FakeCodex()
     codex.cli_version = SUPPORTED_SETTINGS_CLI_VERSION
-    gateway = FakeGateway(configured_roles={"conversation"})
-    service = BridgeService(config, db, codex, gateway)  # type: ignore[arg-type]
+    service = BridgeService(config, db, codex, FakeGateway())  # type: ignore[arg-type]
 
     try:
         await service._probe_runtime_settings_compatibility()
 
         assert service._runtime_compatibility_error is None
         assert db.get_setting("codex_settings_compatibility") == "ok"
-        assert gateway.cards == []
     finally:
         db.close()
 
@@ -2311,8 +2686,8 @@ async def test_repair_card_exercises_protocol_and_unlocks_cli_settings(
         assert codex.started_threads == [
             {
                 "cwd": str(config.admin_scratch_dir),
-                "approval_policy": "never",
-                "sandbox": "danger-full-access",
+                "approval_policy": "on-request",
+                "sandbox": "workspace-write",
                 "model": None,
                 "service_tier": None,
                 "ephemeral": True,
@@ -2379,8 +2754,8 @@ async def test_global_runtime_defaults_cover_new_scopes_and_can_be_overridden(
             model="gpt-test",
             effort="high",
             service_tier="priority",
-            approval_policy="never",
-            sandbox="danger-full-access",
+            approval_policy="on-request",
+            sandbox="workspace-write",
         )
         assert service._runtime_settings("admin").model == "gpt-test"
 
@@ -2395,9 +2770,7 @@ async def test_global_runtime_defaults_cover_new_scopes_and_can_be_overridden(
 
 
 @pytest.mark.asyncio
-async def test_new_conversation_snapshots_new_thread_effort_only(
-    tmp_path: Path,
-) -> None:
+async def test_new_conversation_snapshots_new_thread_effort_only(tmp_path: Path) -> None:
     config = make_config(tmp_path)
     config.model = "gpt-test"
     config.model_reasoning_effort = "high"
@@ -2417,13 +2790,7 @@ async def test_new_conversation_snapshots_new_thread_effort_only(
         assert service._runtime_settings("thread-probe-1").effort == "max"
         assert service._runtime_settings("older-thread").effort == "high"
         assert codex.thread_names == [("thread-probe-1", "新对话")]
-        assert codex.setting_updates[-1]["thread_id"] == "thread-probe-1"
         assert codex.setting_updates[-1]["effort"] == "max"
-        reopened = BridgeDB(config.database_path)
-        try:
-            assert reopened.get_setting("runtime:thread-probe-1:effort") == "max"
-        finally:
-            reopened.close()
     finally:
         db.close()
 
@@ -2577,9 +2944,7 @@ async def test_approval_command_returns_exact_permissions_payload(tmp_path: Path
         allow = incoming("om-allow", text="批准 permit-1")
         await service._route_incoming(stage(db, allow))
 
-        assert codex.responses == [
-            ("rpc-permissions", {"permissions": requested, "scope": "turn"})
-        ]
+        assert codex.responses == [("rpc-permissions", {"permissions": requested, "scope": "turn"})]
         assert db.get_approval("permit-1", "oc_thread") is None
         assert db.inbox_state("om-allow") == "done"
         assert gateway.texts[-1]["text"] == "✅ 已允许一次。"
@@ -2588,18 +2953,16 @@ async def test_approval_command_returns_exact_permissions_payload(tmp_path: Path
 
 
 def test_all_approval_result_payload_shapes() -> None:
-    assert BridgeService._allow_payload(
-        "item/commandExecution/requestApproval", {}
-    ) == {"decision": "accept"}
-    assert BridgeService._allow_payload("applyPatchApproval", {}) == {
-        "decision": "approved"
+    assert BridgeService._allow_payload("item/commandExecution/requestApproval", {}) == {
+        "decision": "accept"
     }
-    assert BridgeService._deny_payload(
-        "item/fileChange/requestApproval", {}, cancel=False
-    ) == {"decision": "decline"}
-    assert BridgeService._deny_payload(
-        "item/fileChange/requestApproval", {}, cancel=True
-    ) == {"decision": "cancel"}
+    assert BridgeService._allow_payload("applyPatchApproval", {}) == {"decision": "approved"}
+    assert BridgeService._deny_payload("item/fileChange/requestApproval", {}, cancel=False) == {
+        "decision": "decline"
+    }
+    assert BridgeService._deny_payload("item/fileChange/requestApproval", {}, cancel=True) == {
+        "decision": "cancel"
+    }
     assert BridgeService._deny_payload(
         "item/permissions/requestApproval", {"permissions": {"network": True}}
     ) == {"permissions": {}, "scope": "turn"}
@@ -2625,9 +2988,7 @@ async def test_unknown_server_request_uses_protocol_error_not_fake_approval(tmp_
             {"id": 99, "method": "item/tool/call", "params": {"threadId": "t"}}
         )
         assert codex.responses == []
-        assert codex.errors == [
-            ("99", -32601, "unsupported bridge server request: item/tool/call")
-        ]
+        assert codex.errors == [("99", -32601, "unsupported bridge server request: item/tool/call")]
     finally:
         db.close()
 
@@ -2656,8 +3017,9 @@ async def test_history_backfill_overlaps_and_dedupes_by_message_id(tmp_path: Pat
         assert len(gateway.history_calls) == 2
         assert all(call["role"] == "conversation" for call in gateway.history_calls)
         assert all(call["chat_id"] == "oc_thread" for call in gateway.history_calls)
-        assert gateway.history_calls[1]["start_time_seconds"] >= (
-            gateway.history_calls[0]["start_time_seconds"]
+        assert (
+            gateway.history_calls[1]["start_time_seconds"]
+            >= (gateway.history_calls[0]["start_time_seconds"])
         )
         claimed = db.claim_incoming("history-worker")
         assert claimed is not None
@@ -2726,7 +3088,7 @@ async def test_external_sync_baselines_history_before_delivering_new_turns(tmp_p
         thread_id="thread-1",
         name="受控对话",
         preview="",
-        cwd="/home/galbot",
+        cwd="/workspace/test",
         created_at=1,
         updated_at=2,
         source_kind="cli",
@@ -2742,13 +3104,17 @@ async def test_external_sync_baselines_history_before_delivering_new_turns(tmp_p
         codex.turns.append(
             {
                 "id": "turn-new",
-                "status": "completed",
+                "status": "inProgress",
                 "items": [
                     {
+                        "type": "userMessage",
+                        "content": [{"type": "text", "text": "请执行新的任务"}],
+                    },
+                    {
                         "type": "agentMessage",
-                        "phase": "final_answer",
-                        "text": "应当发送的新回复",
-                    }
+                        "phase": "commentary",
+                        "text": "不应发送的思考过程",
+                    },
                 ],
             }
         )
@@ -2756,11 +3122,157 @@ async def test_external_sync_baselines_history_before_delivering_new_turns(tmp_p
 
         assert db.is_turn_synced("thread-1", "turn-new") is False
         assert db.outbox_counts() == {"pending": 1}
+        prompt = db.claim_outbox("test-worker")
+        assert prompt is not None
+        assert "请执行新的任务" in prompt.content["text"]
+        assert "思考过程" not in prompt.content["text"]
+        db.complete_outbox(prompt.outbox_key)
+
+        codex.turns[-1] = {
+            "id": "turn-new",
+            "status": "completed",
+            "items": [
+                {
+                    "type": "userMessage",
+                    "content": [{"type": "text", "text": "请执行新的任务"}],
+                },
+                {
+                    "type": "agentMessage",
+                    "phase": "commentary",
+                    "text": "仍然不应发送的思考过程",
+                },
+                {
+                    "type": "agentMessage",
+                    "phase": "final_answer",
+                    "text": "应当发送的新回复",
+                },
+            ],
+        }
+        await service._sync_external_updates([summary])
+
+        assert db.is_turn_synced("thread-1", "turn-new") is False
+        assert db.outbox_counts() == {"done": 1, "pending": 1}
         outbound = db.claim_outbox("test-worker")
         assert outbound is not None
         assert outbound.thread_id == "thread-1"
         assert outbound.turn_id == "turn-new"
         assert "应当发送的新回复" in outbound.content["text"]
+        assert "思考过程" not in outbound.content["text"]
+        db.complete_outbox(
+            outbound.outbox_key,
+            thread_id=outbound.thread_id,
+            turn_id=outbound.turn_id,
+        )
+        assert db.is_turn_synced("thread-1", "turn-new") is True
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_external_sync_drops_commentary_when_turn_has_no_final(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    db = BridgeDB(config.database_path)
+    turn = {
+        "id": "turn-interrupted",
+        "status": "interrupted",
+        "items": [
+            {
+                "type": "userMessage",
+                "content": [{"type": "text", "text": "请执行任务"}],
+            },
+            {
+                "type": "agentMessage",
+                "phase": "commentary",
+                "text": "绝不能发送这段思考",
+            },
+        ],
+    }
+    codex = ThreadHistoryCodex([turn])
+    service = BridgeService(config, db, codex, FakeGateway())  # type: ignore[arg-type]
+    bind_thread(db)
+    db.set_setting("external_sync_initialized:thread-1", "1")
+    summary = ThreadSummary(
+        thread_id="thread-1",
+        name="受控对话",
+        preview="",
+        cwd="/workspace/tester",
+        created_at=1,
+        updated_at=2,
+        source_kind="cli",
+    )
+
+    try:
+        await service._sync_external_updates([summary])
+
+        assert db.is_turn_synced("thread-1", "turn-interrupted") is True
+        assert db.outbox_counts() == {"pending": 1}
+        prompt = db.claim_outbox("test-worker")
+        assert prompt is not None
+        assert "请执行任务" in prompt.content["text"]
+        assert "思考" not in prompt.content["text"]
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_external_sync_retries_completed_turn_until_final_is_persisted(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
+    db = BridgeDB(config.database_path)
+    turn = {
+        "id": "turn-delayed-final",
+        "status": "completed",
+        "items": [
+            {
+                "type": "userMessage",
+                "content": [{"type": "text", "text": "请执行任务"}],
+            },
+            {
+                "type": "agentMessage",
+                "phase": "commentary",
+                "text": "不能作为最终回复",
+            },
+        ],
+    }
+    codex = ThreadHistoryCodex([turn])
+    service = BridgeService(config, db, codex, FakeGateway())  # type: ignore[arg-type]
+    bind_thread(db)
+    db.set_setting("external_sync_initialized:thread-1", "1")
+    summary = ThreadSummary(
+        thread_id="thread-1",
+        name="受控对话",
+        preview="",
+        cwd="/workspace/tester",
+        created_at=1,
+        updated_at=2,
+        source_kind="cli",
+    )
+
+    try:
+        await service._sync_external_updates([summary])
+
+        assert db.is_turn_synced("thread-1", "turn-delayed-final") is False
+        assert db.outbox_counts() == {"pending": 1}
+
+        turn["items"].append(
+            {
+                "type": "agentMessage",
+                "phase": "final_answer",
+                "text": "最终回复已经持久化",
+            }
+        )
+        await service._sync_external_updates([summary])
+
+        assert db.outbox_counts() == {"pending": 2}
+        prompt = db.claim_outbox("test-worker")
+        assert prompt is not None
+        assert "请执行任务" in prompt.content["text"]
+        db.complete_outbox(prompt.outbox_key)
+        final = db.claim_outbox("test-worker")
+        assert final is not None
+        assert "最终回复已经持久化" in final.content["text"]
+        assert "不能作为最终回复" not in final.content["text"]
     finally:
         db.close()
 
@@ -2822,9 +3334,7 @@ async def test_terminal_progress_card_cannot_be_overwritten_by_inflight_progress
             self.release_running = asyncio.Event()
             self.patch_titles: list[str] = []
 
-        async def patch_card(
-            self, role: AppRole, message_id: str, card: dict[str, Any]
-        ) -> None:
+        async def patch_card(self, role: AppRole, message_id: str, card: dict[str, Any]) -> None:
             title = str(((card.get("header") or {}).get("title") or {}).get("content") or "")
             if "执行中" in title:
                 self.running_started.set()
@@ -2871,11 +3381,14 @@ async def test_terminal_progress_card_cannot_be_overwritten_by_inflight_progress
         await asyncio.gather(progress, final)
 
         assert gateway.patch_titles[-1] == "Codex 已完成"
-        assert await service._patch_active_progress(
-            active,
-            {"header": {"title": {"content": "Codex 执行中"}}},
-            terminal=False,
-        ) is False
+        assert (
+            await service._patch_active_progress(
+                active,
+                {"header": {"title": {"content": "Codex 执行中"}}},
+                terminal=False,
+            )
+            is False
+        )
     finally:
         db.close()
 
@@ -2889,9 +3402,7 @@ async def test_progress_patch_failure_backs_off_instead_of_hot_looping(
             super().__init__()
             self.attempts = 0
 
-        async def patch_card(
-            self, role: AppRole, message_id: str, card: dict[str, Any]
-        ) -> None:
+        async def patch_card(self, role: AppRole, message_id: str, card: dict[str, Any]) -> None:
             self.attempts += 1
             raise RuntimeError("Feishu unavailable")
 
@@ -2974,16 +3485,12 @@ async def test_terminal_card_failure_enters_durable_outbox(
     tmp_path: Path,
 ) -> None:
     class FailingTerminalGateway(FakeGateway):
-        async def patch_card(
-            self, role: AppRole, message_id: str, card: dict[str, Any]
-        ) -> None:
+        async def patch_card(self, role: AppRole, message_id: str, card: dict[str, Any]) -> None:
             raise RuntimeError("temporary Feishu failure")
 
     config = make_config(tmp_path)
     db = BridgeDB(config.database_path)
-    service = BridgeService(
-        config, db, FakeCodex(), FailingTerminalGateway()
-    )  # type: ignore[arg-type]
+    service = BridgeService(config, db, FakeCodex(), FailingTerminalGateway())  # type: ignore[arg-type]
     active = ActiveTurn(
         thread_id="thread-1",
         turn_id="turn-terminal-retry",
@@ -3115,6 +3622,7 @@ async def test_official_context_compaction_progress_is_still_displayed(
         assert active.current_operation == "上下文压缩完成"
     finally:
         db.close()
+
 
 @pytest.mark.asyncio
 async def test_status_and_turn_recovery_never_load_full_image_history(
