@@ -110,6 +110,27 @@ def test_remote_bootstrap_generates_real_newlines():
     assert all("\n[Service]\n" in c or "\n[Timer]\n" in c for c in contents)
 
 
+def test_real_systemd_parser_validates_paths_before_activation(tmp_path: Path, monkeypatch):
+    import os
+    import shutil
+    from codex_feishu_bridge import fleet
+    runtime = Path(os.environ.get("XDG_RUNTIME_DIR", "/missing"))
+    if not shutil.which("systemd-analyze") or not (runtime / "bus").exists():
+        pytest.skip("user systemd is not available in this test environment")
+    root = tmp_path / "release"
+    binary = root / ".venv/bin/codex-feishu-bridge"
+    binary.parent.mkdir(parents=True)
+    binary.symlink_to("/usr/bin/true")
+    monkeypatch.setattr(fleet, "STATE", tmp_path)
+    content = fleet.bridge_dropin(root)
+    assert f"WorkingDirectory={root}\n" in content
+    fleet.validate_units(root, {})
+    monkeypatch.setattr(fleet, "bridge_dropin",
+                        lambda _: content.replace(f"WorkingDirectory={root}", f'WorkingDirectory="{root}"'))
+    with pytest.raises((subprocess.CalledProcessError, RuntimeError)):
+        fleet.validate_units(root, {})
+
+
 def test_failed_activation_rolls_back_settings_without_losing_new_messages(tmp_path: Path, monkeypatch):
     from codex_feishu_bridge import fleet
     home = tmp_path / "home"

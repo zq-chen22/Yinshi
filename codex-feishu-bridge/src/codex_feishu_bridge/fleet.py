@@ -10,8 +10,10 @@ import os
 from pathlib import Path
 import re
 import shutil
+import shlex
 import sqlite3
 import subprocess
+import tempfile
 import time
 
 from .codex_client import CodexAppServer
@@ -67,7 +69,14 @@ def update_bridge_config(path: Path, values: dict) -> None:
 
 
 async def verify_catalog(codex_bin: str, policy: dict) -> dict:
-    async with CodexAppServer(codex_bin, request_timeout=45) as client:
+    # The node may need a local proxy that is configured on its main unit.
+    # Reuse it in memory only; do not log, persist, or transfer its values.
+    names = {"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+             "http_proxy", "https_proxy", "all_proxy", "no_proxy", "CODEX_HOME"}
+    raw = subprocess.check_output(["systemctl", "--user", "show", UNIT, "-p", "Environment", "--value"], text=True)
+    env = {key: value for item in shlex.split(raw) if "=" in item
+           for key, value in [item.split("=", 1)] if key in names}
+    async with CodexAppServer(codex_bin, request_timeout=45, env=env) as client:
         models = await client.list_models()
         for name, effort in [(policy["model"], policy["effort"]),
                              (policy["random_model"], policy["random_effort"])]:
@@ -159,9 +168,28 @@ def auxiliary_dropins(root: Path) -> dict[Path, str]:
     }
     return {
         units / (name + ".d") / "50-yinshi-release.conf":
-        f'[Service]\nWorkingDirectory="{root}"\nExecStart=\nExecStart={command}\n'
+        f'[Service]\nWorkingDirectory={root}\nExecStart=\nExecStart={command}\n'
         for name, command in commands.items() if (units / name).exists()
     }
+
+
+def bridge_dropin(root: Path) -> str:
+    executable = root / ".venv/bin/codex-feishu-bridge"
+    return f'[Service]\nWorkingDirectory={root}\nExecStart=\nExecStart="{executable}" --config "{CONFIG}" run\nTimeoutStopSec=21630\nKillMode=mixed\n'
+
+
+def validate_units(root: Path, auxiliaries: dict[Path, str]) -> None:
+    """Use the real systemd parser before stopping any existing process."""
+    with tempfile.TemporaryDirectory(prefix="unit-check-", dir=STATE) as temporary:
+        paths = []
+        for i, content in enumerate([bridge_dropin(root), *auxiliaries.values()]):
+            path = Path(temporary) / f"yinshi-check-{i}.service"
+            path.write_text("[Unit]\nDescription=Yinshi preflight validation\n" + content)
+            paths.append(str(path))
+        result = subprocess.run(["systemd-analyze", "--user", "verify", *paths],
+                                check=True, capture_output=True, text=True, timeout=30)
+        if result.stderr and result.stderr.strip():
+            raise RuntimeError("systemd preflight emitted unit diagnostics")
 
 
 def activate(request_path: Path) -> int:
@@ -203,6 +231,7 @@ def activate(request_path: Path) -> int:
     dropin = Path.home() / ".config/systemd/user" / (UNIT + ".d") / "50-yinshi-release.conf"
     original_dropin = dropin.read_text() if dropin.exists() else None
     auxiliaries = auxiliary_dropins(release / "codex-feishu-bridge")
+    validate_units(release / "codex-feishu-bridge", auxiliaries)
     original_auxiliaries = {p: p.read_text() if p.exists() else None for p in auxiliaries}
     original_config = CONFIG.read_text()
     shutil.copy2(CONFIG, backup / "config.toml")
@@ -246,9 +275,8 @@ def activate(request_path: Path) -> int:
         finally:
             db.close()
         root = release / "codex-feishu-bridge"
-        executable = root / ".venv/bin/codex-feishu-bridge"
         dropin.parent.mkdir(parents=True, exist_ok=True)
-        dropin.write_text(f'[Service]\nWorkingDirectory="{root}"\nExecStart=\nExecStart="{executable}" --config "{CONFIG}" run\nTimeoutStopSec=21630\nKillMode=mixed\n')
+        dropin.write_text(bridge_dropin(root))
         dropin.chmod(0o600)
         for path, content in auxiliaries.items():
             path.parent.mkdir(parents=True, exist_ok=True)
