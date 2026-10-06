@@ -47,6 +47,7 @@ class DailyStatsConfig:
     spreadsheet_token: str = ""
     sheet_id: str = ""
     timezone: str = "Asia/Shanghai"
+    quota_enabled: bool = True
 
 
 @dataclass(slots=True)
@@ -247,6 +248,7 @@ def load_config(path: str | Path | None = None) -> BridgeConfig:
             spreadsheet_token=str(daily_stats.get("spreadsheet_token", "")).strip(),
             sheet_id=str(daily_stats.get("sheet_id", "")).strip(),
             timezone=str(daily_stats.get("timezone", "Asia/Shanghai")).strip() or "Asia/Shanghai",
+            quota_enabled=bool(daily_stats.get("quota_enabled", True)),
         ),
     )
     _validate_config(cfg)

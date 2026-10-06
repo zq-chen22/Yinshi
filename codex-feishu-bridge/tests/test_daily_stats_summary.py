@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import re
+import json
 from datetime import datetime, timedelta
 from pathlib import Path
+from unittest.mock import AsyncMock
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -159,3 +161,66 @@ async def test_new_device_inserts_both_groups_before_summary(monkeypatch, tmp_pa
     assert sheet.rows[0][1:11:2] == ["旧设备", "旧设备·额度", "新设备", "新设备·额度", "全设备汇总"]
     assert sheet.rows[2][1:5] == [1, 0, "90%", "1%"]
     assert sheet.rows[2][9]["text"].startswith('=SUMIF(B$2:I$2,"总任务"')
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("existing_group", [False, True])
+async def test_quota_disabled_keeps_history_and_task_sync(
+    monkeypatch, tmp_path: Path, existing_group: bool,
+) -> None:
+    import codex_feishu_bridge.daily_stats as stats
+
+    today = datetime.now(ZoneInfo("Asia/Shanghai"))
+    sheet = FakeSheet(today)
+    if existing_group:
+        sheet.rows[0][1] = "新设备"
+        sheet.rows[0][3] = "新设备·额度"
+    state = tmp_path / "state"
+    state.mkdir()
+    quota_path = state / "daily-stats-quota.json"
+    quota_path.write_text('{"untouched": true}\n', encoding="utf-8")
+    before_quota = (quota_path.read_bytes(), quota_path.stat().st_mtime_ns)
+    identity_path = state / "daily-stats-identity.json"
+    identity_path.write_text(json.dumps({
+        "host_id": "host-test", "app_id": "app", "quota_column_start_index": 3,
+    }))
+    config = BridgeConfig(
+        config_path=tmp_path / "config.toml",
+        state_dir=state,
+        feishu=FeishuConfig(conversation=FeishuAppConfig("app", "TEST_APP_SECRET")),
+        daily_stats=DailyStatsConfig(
+            True, "spreadsheet", "sheet", "Asia/Shanghai", quota_enabled=False,
+        ),
+    )
+    quota_reader = AsyncMock(side_effect=AssertionError("quota API must not be called"))
+
+    def forbidden(*_args):
+        raise AssertionError("quota samples must not be read or written")
+
+    monkeypatch.setenv("TEST_APP_SECRET", "dummy")
+    monkeypatch.setattr(stats, "FeishuSheetsClient", lambda *_args, **_kwargs: sheet)
+    monkeypatch.setattr(stats, "detect_host_id", lambda: ("host-test", "host"))
+    monkeypatch.setattr(
+        stats, "calculate_daily_counts",
+        lambda _config, targets: tuple(DailyCount(day, 3, 1) for day in targets),
+    )
+    monkeypatch.setattr(stats, "read_weekly_quota", quota_reader)
+    monkeypatch.setattr(stats, "save_sample", forbidden)
+    monkeypatch.setattr(stats, "load_samples", forbidden)
+
+    result = await sync_daily_stats(config)
+
+    quota_reader.assert_not_awaited()
+    assert result.quota_column_start_index is None
+    assert result.quota_cells == ()
+    assert result.read_verified and result.write_verified and result.other_data_preserved
+    assert sheet.inserted == ([] if existing_group else [5])
+    assert result.column_start_index == (1 if existing_group else 5)
+    assert sheet.rows[2][3:5] == ["90%", "1%"]
+    assert sheet.rows[3][3:5] == ["91%", "2%"]
+    assert sheet.rows[0][3] == ("新设备·额度" if existing_group else "旧设备·额度")
+    assert sheet.rows[2][result.column_start_index:result.column_start_index + 2] == [3, 1]
+    assert (quota_path.read_bytes(), quota_path.stat().st_mtime_ns) == before_quota
+    identity = json.loads(identity_path.read_text())
+    assert identity["quota_enabled"] is False
+    assert identity["quota_column_start_index"] == 3

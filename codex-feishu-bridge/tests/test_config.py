@@ -65,3 +65,16 @@ def test_packaged_configuration_template_matches_repository_copy() -> None:
     packaged = resources.files("codex_feishu_bridge").joinpath("config.example.toml")
 
     assert packaged.read_text(encoding="utf-8") == repository.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("setting, expected", [("", True), ("quota_enabled = false", False)])
+def test_daily_stats_quota_switch(tmp_path: Path, setting: str, expected: bool) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        f'[bridge]\nstate_dir = "{tmp_path / "state"}"\n'
+        f'[daily_stats]\nenabled = true\n{setting}\n',
+        encoding="utf-8",
+    )
+    config = load_config(path)
+    assert config.daily_stats.enabled is True
+    assert config.daily_stats.quota_enabled is expected

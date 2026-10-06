@@ -74,6 +74,9 @@ max_upload_bytes = 31457280
 # 每次同步只通过官方 Codex CLI app-server 的 account/rateLimits/read
 # 采样周额度，不会新建 Codex 对话；与每日任务统计共用同一计时器。
 enabled = false
+# 同一 Codex 账号由单个节点采样额度；其他节点设为 false，仅同步任务次数。
+# 关闭后不调用额度 API，不写额度列，既有额度历史原样保留。
+quota_enabled = true
 spreadsheet_token = ""
 sheet_id = ""
 timezone = "Asia/Shanghai"

@@ -119,23 +119,26 @@ async def _sync_daily_stats(config: BridgeConfig, db: BridgeDB) -> int:
         return 1
     left = column_name(result.column_start_index)
     right = column_name(result.column_start_index + 1)
-    quota_left = column_name(result.quota_column_start_index)
-    quota_right = column_name(result.quota_column_start_index + 1)
+    quota_columns = "已关闭"
+    if result.quota_column_start_index is not None:
+        quota_left = column_name(result.quota_column_start_index)
+        quota_right = column_name(result.quota_column_start_index + 1)
+        quota_columns = f"{quota_left}:{quota_right}"
     summary_left = column_name(result.summary_column_start_index)
     summary_right = column_name(result.summary_column_start_index + 1)
     print(f"主机：{result.identity.hostname}（{result.identity.host_id}）")
     print(f"机器人：{result.identity.bot_name}")
     print(
-        f"工作表：{result.sheet_title}；任务列：{left}:{right}；额度列：{quota_left}:{quota_right}；"
+        f"工作表：{result.sheet_title}；任务列：{left}:{right}；额度统计：{quota_columns}；"
         f"汇总列：{summary_left}:{summary_right}（{result.summary_row_count} 个日期）"
     )
     for count in result.counts:
         quota = next((item for item in result.quota_cells if item[0] == count.day), None)
         remaining, used = (quota[1], quota[2]) if quota else ("", "")
-        print(
-            f"{count.day.isoformat()}：总任务 {count.total}，长任务 {count.long}，"
-            f"剩余周额度 {remaining or '—'}，当日观测用量 {used or '—'}"
-        )
+        description = f"{count.day.isoformat()}：总任务 {count.total}，长任务 {count.long}"
+        if result.quota_column_start_index is not None:
+            description += f"，剩余周额度 {remaining or '—'}，当日观测用量 {used or '—'}"
+        print(description)
     print("验证：读取成功；写入并回读成功；其他机器人列和历史数据保持不变。")
     return 0
 

@@ -55,7 +55,7 @@ class DailyCount:
 class SyncResult:
     identity: HostIdentity
     column_start_index: int
-    quota_column_start_index: int
+    quota_column_start_index: int | None
     summary_column_start_index: int
     summary_row_count: int
     counts: tuple[DailyCount, ...]
@@ -719,7 +719,7 @@ def _save_identity(
     path: Path,
     identity: HostIdentity,
     column_start_index: int,
-    quota_column_start_index: int,
+    quota_column_start_index: int | None,
     config: BridgeConfig,
 ) -> None:
     payload = {
@@ -728,7 +728,13 @@ def _save_identity(
         "spreadsheet_token": config.daily_stats.spreadsheet_token,
         "sheet_id": config.daily_stats.sheet_id,
         "column_start_index": column_start_index,
-        "quota_column_start_index": quota_column_start_index,
+        # Retain the legacy location as a hint; disabled quota columns and
+        # their history remain untouched, even when another host owns sampling.
+        "quota_column_start_index": (
+            quota_column_start_index if quota_column_start_index is not None
+            else (_load_identity(path) or {}).get("quota_column_start_index")
+        ),
+        "quota_enabled": config.daily_stats.quota_enabled,
         "updated_at": int(time.time()),
     }
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -779,30 +785,31 @@ async def sync_daily_stats(config: BridgeConfig, db: BridgeDB | None = None) -> 
     if previous and str(previous.get("app_id") or "") != app.app_id:
         raise DailyStatsError("daily stats identity belongs to a different Feishu app")
 
-    quota_path = config.state_dir / "daily-stats-quota.json"
-    quota_failed = False
-    try:
-        sample = await read_weekly_quota(config.codex_bin)
-        samples = save_sample(quota_path, sample, timezone_info)
-    except Exception as error:
-        quota_failed = True
-        LOG.warning("Codex weekly quota sample unavailable: %s", type(error).__name__)
-        try:
-            samples = load_samples(quota_path)
-        except Exception:
-            samples = []
-    quotas = daily_quota(samples, set(targets), timezone_info)
     quota_cells_list: list[tuple[date, str, str]] = []
-    for day in targets:
-        if quota_failed and day == today:
-            quota_cells_list.append((day, "读取失败", "读取失败"))
-        elif day in quotas:
-            quota = quotas[day]
-            quota_cells_list.append(
-                (day, format_percent(quota.remaining_percent), format_percent(quota.used_percent))
-            )
-        else:
-            quota_cells_list.append((day, "", ""))
+    if stats.quota_enabled:
+        quota_path = config.state_dir / "daily-stats-quota.json"
+        quota_failed = False
+        try:
+            sample = await read_weekly_quota(config.codex_bin)
+            samples = save_sample(quota_path, sample, timezone_info)
+        except Exception as error:
+            quota_failed = True
+            LOG.warning("Codex weekly quota sample unavailable: %s", type(error).__name__)
+            try:
+                samples = load_samples(quota_path)
+            except Exception:
+                samples = []
+        quotas = daily_quota(samples, set(targets), timezone_info)
+        for day in targets:
+            if quota_failed and day == today:
+                quota_cells_list.append((day, "读取失败", "读取失败"))
+            elif day in quotas:
+                quota = quotas[day]
+                quota_cells_list.append(
+                    (day, format_percent(quota.remaining_percent), format_percent(quota.used_percent))
+                )
+            else:
+                quota_cells_list.append((day, "", ""))
     quota_cells = tuple(quota_cells_list)
 
     async with FeishuSheetsClient(app.app_id, app.secret(), db=db) as client:
@@ -851,14 +858,15 @@ async def sync_daily_stats(config: BridgeConfig, db: BridgeDB | None = None) -> 
             reserved[0][start_column] = bot_name
             reserved[1][start_column] = TOTAL_HEADER
             reserved[1][start_column + 1] = LONG_HEADER
-        quota_start_column = choose_quota_column(
-            reserved,
-            bot_name,
-            column_count=column_count,
-            previous_identity=previous,
+        quota_start_column = (
+            choose_quota_column(
+                reserved, bot_name, column_count=column_count, previous_identity=previous,
+            ) if stats.quota_enabled else None
         )
         first = _padded_row(header_rows, 0, column_count)
-        quota_missing = first[quota_start_column] in (None, "")
+        quota_missing = (
+            quota_start_column is not None and first[quota_start_column] in (None, "")
+        )
         if quota_missing and summary_start is not None:
             await client.insert_columns(stats.spreadsheet_token, stats.sheet_id, summary_start)
             if start_column >= summary_start:
@@ -882,7 +890,8 @@ async def sync_daily_stats(config: BridgeConfig, db: BridgeDB | None = None) -> 
                 if first[index] not in (None, "") or second[index] not in (None, "")
             ]
             summary_start = max(
-                max(occupied, default=0) + 1, start_column + 2, quota_start_column + 2
+                max(occupied, default=0) + 1, start_column + 2,
+                quota_start_column + 2 if quota_start_column is not None else 0,
             )
             if summary_start + 1 >= column_count:
                 raise DailyStatsError("sheet does not have two empty columns for the summary")
@@ -892,12 +901,12 @@ async def sync_daily_stats(config: BridgeConfig, db: BridgeDB | None = None) -> 
         own_columns = {
             start_column,
             start_column + 1,
-            quota_start_column,
-            quota_start_column + 1,
             summary_start,
             summary_start + 1,
         }
-        compare_width = max(start_column + 2, quota_start_column + 2, summary_start + 2, 3)
+        if quota_start_column is not None:
+            own_columns.update((quota_start_column, quota_start_column + 1))
+        compare_width = max(3, max(own_columns) + 1) if stats.quota_enabled else column_count
         compare_end = column_name(compare_width - 1)
         before_values = await client.values(
             stats.spreadsheet_token, f"{stats.sheet_id}!A1:{compare_end}{row_count}"
@@ -914,12 +923,15 @@ async def sync_daily_stats(config: BridgeConfig, db: BridgeDB | None = None) -> 
         second = _padded_row(header_rows, 1, column_count)
         left = column_name(start_column)
         right = column_name(start_column + 1)
-        quota_left = column_name(quota_start_column)
-        quota_right = column_name(quota_start_column + 1)
+        quota_left = column_name(quota_start_column) if quota_start_column is not None else ""
+        quota_right = column_name(quota_start_column + 1) if quota_start_column is not None else ""
         summary_left = column_name(summary_start)
         summary_right = column_name(summary_start + 1)
         merged = _merge_matches(sheet.get("merges") or [], start_column)
-        quota_merged = _merge_matches(sheet.get("merges") or [], quota_start_column)
+        quota_merged = (
+            quota_start_column is not None
+            and _merge_matches(sheet.get("merges") or [], quota_start_column)
+        )
         summary_merged = _merge_matches(sheet.get("merges") or [], summary_start)
         header_matches = (
             str(first[start_column] or "") == bot_name
@@ -948,7 +960,7 @@ async def sync_daily_stats(config: BridgeConfig, db: BridgeDB | None = None) -> 
             await client.merge_cells(stats.spreadsheet_token, f"{stats.sheet_id}!{left}1:{right}1")
 
         quota_title = f"{bot_name}{QUOTA_GROUP_SUFFIX}"
-        quota_header_matches = (
+        quota_header_matches = quota_start_column is None or (
             str(first[quota_start_column] or "") == quota_title
             and str(second[quota_start_column] or "") == REMAINING_HEADER
             and str(second[quota_start_column + 1] or "") == DAILY_USAGE_HEADER
@@ -974,7 +986,7 @@ async def sync_daily_stats(config: BridgeConfig, db: BridgeDB | None = None) -> 
                     f"{stats.sheet_id}!{quota_left}1:{quota_right}2",
                     [[quota_title, ""], [REMAINING_HEADER, DAILY_USAGE_HEADER]],
                 )
-        if not quota_merged:
+        if quota_start_column is not None and not quota_merged:
             await client.merge_cells(
                 stats.spreadsheet_token, f"{stats.sheet_id}!{quota_left}1:{quota_right}1"
             )
@@ -1065,7 +1077,7 @@ async def sync_daily_stats(config: BridgeConfig, db: BridgeDB | None = None) -> 
             and _merge_matches(sheet_after.get("merges") or [], start_column)
         ):
             raise DailyStatsError("bot column group verification failed")
-        if not (
+        if quota_start_column is not None and not (
             str(verify_first[quota_start_column] or "") == quota_title
             and str(verify_second[quota_start_column] or "") == REMAINING_HEADER
             and str(verify_second[quota_start_column + 1] or "") == DAILY_USAGE_HEADER
