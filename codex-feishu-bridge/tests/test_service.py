@@ -2952,6 +2952,95 @@ async def test_approval_command_returns_exact_permissions_payload(tmp_path: Path
         db.close()
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Answer F1 score definition",
+        "answer quality metrics",
+        "回答 F1 如何计算",
+        "allow fallback",
+        "cancel subscription",
+    ],
+)
+@pytest.mark.asyncio
+async def test_approval_words_in_ordinary_prompts_reach_conversation_queue(
+    tmp_path: Path, text: str
+) -> None:
+    config = make_config(tmp_path, owner_conversation_open_id="ou_conversation_owner")
+    db = BridgeDB(config.database_path)
+    gateway = FakeGateway()
+    service = BridgeService(config, db, FakeCodex(), gateway)  # type: ignore[arg-type]
+    bind_thread(db)
+    blocker = asyncio.create_task(asyncio.Event().wait())
+    service._thread_workers["thread-1"] = blocker
+    try:
+        await service._route_incoming(stage(db, incoming("om-ordinary", text=text)))
+
+        assert db.inbox_state("om-ordinary") == "queued"
+        job = service._thread_queues["thread-1"].get_nowait()
+        assert job.inbox.message.text == text
+        assert not gateway.texts
+    finally:
+        blocker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await blocker
+        db.close()
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "回答 abcdefghijklmnopqrstuv example",
+        "allow abcdefghijklmnopqrstuv",
+        "!approval F1 deny",
+    ],
+)
+@pytest.mark.asyncio
+async def test_stale_approval_replies_keep_feedback(tmp_path: Path, text: str) -> None:
+    config = make_config(tmp_path, owner_conversation_open_id="ou_conversation_owner")
+    db = BridgeDB(config.database_path)
+    gateway = FakeGateway()
+    service = BridgeService(config, db, FakeCodex(), gateway)  # type: ignore[arg-type]
+    try:
+        await service._route_incoming(stage(db, incoming("om-stale", text=text)))
+
+        assert db.inbox_state("om-stale") == "done"
+        assert gateway.texts[-1]["text"] == "该审批不存在、已处理或已随服务重启失效。"
+        assert service._thread_queues == {}
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_existing_short_approval_id_remains_an_approval(tmp_path: Path) -> None:
+    config = make_config(tmp_path, owner_conversation_open_id="ou_conversation_owner")
+    db = BridgeDB(config.database_path)
+    codex = FakeCodex()
+    gateway = FakeGateway()
+    service = BridgeService(config, db, codex, gateway)  # type: ignore[arg-type]
+    requested = {"network": {"enabled": True}}
+    codex.pending_requests["rpc-short"] = {"id": "rpc-short"}
+    db.add_approval(
+        PendingApproval(
+            short_id="F1",
+            rpc_id="rpc-short",
+            method="item/permissions/requestApproval",
+            thread_id="thread-1",
+            turn_id="turn-1",
+            chat_id="oc_thread",
+            params={"permissions": requested},
+        )
+    )
+    try:
+        await service._route_incoming(stage(db, incoming("om-short", text="allow F1")))
+
+        assert codex.responses == [("rpc-short", {"permissions": requested, "scope": "turn"})]
+        assert db.inbox_state("om-short") == "done"
+        assert gateway.texts[-1]["text"] == "✅ 已允许一次。"
+    finally:
+        db.close()
+
+
 def test_all_approval_result_payload_shapes() -> None:
     assert BridgeService._allow_payload("item/commandExecution/requestApproval", {}) == {
         "decision": "accept"
