@@ -18,7 +18,8 @@
 <strong>01 / 不同设备</strong>&ensp;在飞书里协调不同设备上的 Codex<br>
 <strong>02 / 状态同步</strong>&ensp;飞书任务中的思考状态、进展与计划，可通过飞书卡片及时同步<br>
 <strong>03 / 文件流转</strong>&ensp;支持上传文件、图片和视频；任务完成后，Codex 会发来必要的图片、文件和视频<br>
-<strong>04 / 无需梯子</strong>&ensp;没有梯子，也能流畅使用 Codex
+<strong>04 / 无需梯子</strong>&ensp;没有梯子，也能流畅使用 Codex<br>
+<strong>05 / 原生引用</strong>&ensp;群聊和私聊的进度与回复自动引用本轮提问，排队和长回复保持关联
 </p>
 
 ## 我们的承诺

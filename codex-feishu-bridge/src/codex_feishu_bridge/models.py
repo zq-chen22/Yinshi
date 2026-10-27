@@ -78,6 +78,7 @@ class InboxItem:
     message: IncomingMessage
     state: str = "pending"
     attempts: int = 0
+
     last_error: str | None = None
 
 
@@ -94,6 +95,7 @@ class OutboxItem:
     thread_id: str | None = None
     turn_id: str | None = None
     attempts: int = 0
+    reply_to_message_id: str | None = None
 
 
 @dataclass(slots=True)

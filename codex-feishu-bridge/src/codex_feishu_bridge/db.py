@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .models import (
+    AppRole,
     Attachment,
     Binding,
     InboxItem,
@@ -83,6 +84,7 @@ CREATE TABLE IF NOT EXISTS outbox_messages (
     content_json TEXT NOT NULL,
     group_key TEXT NOT NULL,
     sequence INTEGER NOT NULL DEFAULT 0,
+    reply_to_message_id TEXT,
     thread_id TEXT,
     turn_id TEXT,
     state TEXT NOT NULL DEFAULT 'pending',
@@ -197,6 +199,8 @@ class BridgeDB:
                 str(row[1])
                 for row in self._conn.execute("PRAGMA table_info(outbox_messages)").fetchall()
             }
+            if "reply_to_message_id" not in outbox_columns:
+                self._conn.execute("ALTER TABLE outbox_messages ADD COLUMN reply_to_message_id TEXT")
             if "group_key" not in outbox_columns:
                 self._conn.execute(
                     "ALTER TABLE outbox_messages ADD COLUMN group_key TEXT NOT NULL DEFAULT ''"
@@ -821,9 +825,9 @@ class BridgeDB:
             cur = self._conn.execute(
                 """INSERT OR IGNORE INTO outbox_messages(
                        outbox_key, app_role, receive_id, receive_id_type, msg_type,
-                       content_json, group_key, sequence, thread_id, turn_id, state, attempts,
+                       content_json, group_key, sequence, thread_id, turn_id, reply_to_message_id, state, attempts,
                        available_at, created_at, updated_at
-                   ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?)""",
+                   ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?)""",
                 (
                     item.outbox_key,
                     item.app_role,
@@ -835,6 +839,7 @@ class BridgeDB:
                     item.sequence,
                     item.thread_id,
                     item.turn_id,
+                    item.reply_to_message_id,
                     now,
                     now,
                     now,
@@ -887,6 +892,7 @@ class BridgeDB:
             thread_id=row["thread_id"],
             turn_id=row["turn_id"],
             attempts=int(row["attempts"]) + 1,
+            reply_to_message_id=row["reply_to_message_id"],
         )
 
     def complete_outbox(
@@ -1038,6 +1044,15 @@ class BridgeDB:
             )
             self._conn.commit()
         return cur.rowcount == 1
+
+    def reply_target_for_turn(self, turn_id: str, chat_id: str, role: AppRole) -> str | None:
+        """Resolve a durable source only within the intended conversation."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT message_id FROM turn_jobs WHERE turn_id=? AND chat_id=? AND app_role=?",
+                (turn_id, chat_id, role),
+            ).fetchone()
+        return str(row["message_id"]) if row else None
 
     def turn_job_message_id(self, turn_id: str) -> str | None:
         with self._lock:

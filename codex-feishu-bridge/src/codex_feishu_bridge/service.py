@@ -872,6 +872,7 @@ class BridgeService:
                 base_key=f"inbox-ambiguous:{message.message_id}",
                 thread_id=None,
                 turn_id=None,
+                reply_to_message_id=message.message_id,
             )
             return
         dead = item.attempts >= 8
@@ -899,6 +900,7 @@ class BridgeService:
                         item.receive_id,
                         path,
                         idempotency_key=item.outbox_key,
+                        reply_to_message_id=item.reply_to_message_id,
                     )
                 elif item.msg_type == "card_patch":
                     await self.gateway.patch_card(
@@ -913,6 +915,7 @@ class BridgeService:
                         str(item.content.get("text") or ""),
                         receive_id_type=item.receive_id_type,
                         idempotency_key=item.outbox_key,
+                        reply_to_message_id=item.reply_to_message_id,
                     )
                 else:
                     await self.gateway.send_message(
@@ -922,6 +925,7 @@ class BridgeService:
                         item.content,
                         receive_id_type=item.receive_id_type,
                         idempotency_key=item.outbox_key,
+                        reply_to_message_id=item.reply_to_message_id,
                     )
             except asyncio.CancelledError:
                 raise
@@ -978,6 +982,7 @@ class BridgeService:
                 base_key=f"attachment-held:{message.message_id}",
                 thread_id=None,
                 turn_id=None,
+                reply_to_message_id=message.message_id,
             )
             return
         if await self._try_artifact_command(item):
@@ -1063,6 +1068,7 @@ class BridgeService:
             "✅ Codex 应用已与本机安全配对。现在可在私聊使用管理功能，"
             "并会创建或接管绑定 Codex thread 的对话群。",
             idempotency_key=f"pair-ack:{message.app_role}:{message.message_id}",
+            reply_to_message_id=message.message_id,
         )
         self.db.complete_incoming(message.message_id)
         if message.app_role == "conversation":
@@ -1700,6 +1706,7 @@ class BridgeService:
             message.chat_id,
             f"⏹️ {prefix}；已清除 {len(cancelled)} 条后续等待任务。",
             idempotency_key=f"stop-all:{message.message_id}",
+            reply_to_message_id=message.message_id,
         )
 
     async def _enable_append_mode(
@@ -1718,6 +1725,7 @@ class BridgeService:
                 message.chat_id,
                 "当前没有正在执行的任务，无法开启“追加信息”。",
                 idempotency_key=f"append-none:{message.message_id}",
+                reply_to_message_id=message.message_id,
             )
             return
 
@@ -1785,6 +1793,7 @@ class BridgeService:
             message.chat_id,
             f"↪️ 已开启追加信息模式，并追加 {appended} 条等待消息{suffix}",
             idempotency_key=f"append-mode:{message.message_id}",
+            reply_to_message_id=message.message_id,
         )
 
     async def _route_conversation(self, item: InboxItem) -> None:
@@ -1796,6 +1805,7 @@ class BridgeService:
                 message.chat_id,
                 "这个群尚未绑定 Codex 对话。请私聊 Codex 机器人发送“同步”。",
                 idempotency_key=f"unbound:{message.message_id}",
+                reply_to_message_id=message.message_id,
             )
             self.db.complete_incoming(message.message_id)
             return
@@ -1828,6 +1838,7 @@ class BridgeService:
                 message.chat_id,
                 f"{status}；等待队列 {queue.qsize() if queue else 0} 条。",
                 idempotency_key=f"status:{message.message_id}",
+                reply_to_message_id=message.message_id,
             )
             self.db.complete_incoming(message.message_id)
             return
@@ -1843,6 +1854,7 @@ class BridgeService:
                 message.chat_id,
                 reply,
                 idempotency_key=f"stop:{message.message_id}",
+                reply_to_message_id=message.message_id,
             )
             self.db.complete_incoming(message.message_id)
             return
@@ -1907,6 +1919,7 @@ class BridgeService:
                 message.chat_id,
                 reply,
                 idempotency_key=f"runtime-incompatible:{message.message_id}",
+                reply_to_message_id=message.message_id,
             )
             self.db.complete_incoming(message.message_id)
             return True
@@ -2132,6 +2145,7 @@ class BridgeService:
                 message.chat_id,
                 card,
                 idempotency_key=f"runtime-config:{kind}:{message.message_id}",
+                reply_to_message_id=message.message_id,
             )
         else:
             await self.gateway.send_text(
@@ -2139,6 +2153,7 @@ class BridgeService:
                 message.chat_id,
                 reply,
                 idempotency_key=f"runtime-config:{kind}:{message.message_id}",
+                reply_to_message_id=message.message_id,
             )
         self.db.complete_incoming(message.message_id)
         return True
@@ -2157,6 +2172,7 @@ class BridgeService:
                         self._runtime_compatibility_error,
                     ),
                     idempotency_key=f"settings-compat-show:{message.message_id}",
+                    reply_to_message_id=message.message_id,
                 )
             else:
                 await self.gateway.send_text(
@@ -2164,6 +2180,7 @@ class BridgeService:
                     message.chat_id,
                     "✅ 当前 Codex CLI 设置能力已经验证，无需修复。",
                     idempotency_key=f"settings-compat-ok:{message.message_id}",
+                    reply_to_message_id=message.message_id,
                 )
             self.db.complete_incoming(message.message_id)
             return True
@@ -2213,6 +2230,7 @@ class BridgeService:
             message.chat_id,
             progress_card("Codex CLI 设置兼容", reply, color=color),
             idempotency_key=f"settings-compat-result:{message.message_id}",
+            reply_to_message_id=message.message_id,
         )
         self.db.complete_incoming(message.message_id)
         return True
@@ -2537,6 +2555,7 @@ class BridgeService:
                 message.chat_id,
                 "↪️ 已把补充要求送入当前执行。",
                 idempotency_key=f"steered:{message.message_id}",
+                reply_to_message_id=message.message_id,
             )
         return True
 
@@ -2557,6 +2576,7 @@ class BridgeService:
                 "会把等待消息并入当前轮，发送 `停止任务` 会中断并清空等待队列。",
             ),
             idempotency_key=f"progress:{item.message.message_id}",
+            reply_to_message_id=item.message.message_id,
         )
         await queue.put(
             ScheduledMessage(
@@ -2977,6 +2997,7 @@ class BridgeService:
             message.chat_id,
             progress_card("私聊临时对话", "已收到，正在用一个不保留上下文的 Codex 对话处理。"),
             idempotency_key=f"admin-progress:{message.message_id}",
+            reply_to_message_id=message.message_id,
         )
         await self._admin_queue.put(
             ScheduledMessage(
@@ -3105,6 +3126,7 @@ class BridgeService:
             message.chat_id,
             text,
             idempotency_key=f"admin:{kind}:{message.message_id}",
+            reply_to_message_id=message.message_id,
         )
 
     async def _progress_loop(self) -> None:
@@ -3562,6 +3584,7 @@ class BridgeService:
         self.db.enqueue_outbox(
             OutboxItem(
                 outbox_key=f"zz-artifact-approval:{active.turn_id}:{approval_id}",
+                reply_to_message_id=self.db.reply_target_for_turn(active.turn_id, active.chat_id, active.app_role),
                 app_role=active.app_role,
                 receive_id=active.chat_id,
                 receive_id_type="chat_id",
@@ -3582,7 +3605,10 @@ class BridgeService:
         thread_id: str | None,
         turn_id: str | None,
         artifact_paths: list[Path] | None = None,
+        reply_to_message_id: str | None = None,
     ) -> None:
+        if reply_to_message_id is None and turn_id:
+            reply_to_message_id = self.db.reply_target_for_turn(turn_id, chat_id, app_role)
         parts = _split_utf8(text, 100_000) or [""]
         for index, part in enumerate(parts):
             rendered = part
@@ -3601,6 +3627,7 @@ class BridgeService:
                     sequence=index,
                     thread_id=thread_id if is_last else None,
                     turn_id=turn_id if is_last else None,
+                    reply_to_message_id=reply_to_message_id,
                 )
             )
         for index, path in enumerate(artifact_paths or []):
@@ -3615,6 +3642,7 @@ class BridgeService:
                     content={"path": str(path), "sha256": fingerprint},
                     group_key=base_key,
                     sequence=len(parts) + index,
+                    reply_to_message_id=reply_to_message_id,
                 )
             )
 
@@ -3647,6 +3675,7 @@ class BridgeService:
                     active.chat_id,
                     f"⚠️ 收到桥接器尚未实现的请求类型 `{method}`，已用协议错误安全终止该请求。",
                     idempotency_key=f"unknown-server-request:{rpc_id}",
+                    reply_to_message_id=self.db.reply_target_for_turn(active.turn_id, active.chat_id, active.app_role),
                 )
             return
         if active:
@@ -3666,6 +3695,7 @@ class BridgeService:
                 "🔒 Codex 请求了秘密输入。桥接器不会让密码、Token 或 Secret 经过飞书，"
                 "已返回空答案；如确有需要，请在本机受信终端完成。",
                 idempotency_key=f"secret-question:{rpc_id}",
+                reply_to_message_id=(self.db.reply_target_for_turn(turn_id, chat_id, role) if active else None),
             )
             return
         short_id = secrets.token_urlsafe(16)
@@ -3701,6 +3731,7 @@ class BridgeService:
                 chat_id,
                 card,
                 idempotency_key=f"approval:{rpc_id}",
+                reply_to_message_id=(self.db.reply_target_for_turn(turn_id, chat_id, role) if active else None),
             )
         except Exception:
             LOG.exception("Could not deliver approval ref=%s; denying", _log_ref(rpc_id))
@@ -3751,6 +3782,7 @@ class BridgeService:
                 item.message.chat_id,
                 "该审批不存在、已处理或已随服务重启失效。",
                 idempotency_key=f"approval-stale:{item.message.message_id}",
+                reply_to_message_id=item.message.message_id,
             )
             self.db.complete_incoming(item.message.message_id)
             return True
@@ -3761,6 +3793,7 @@ class BridgeService:
                     item.message.chat_id,
                     f"这是问题而不是权限审批，请用 `回答 {short_id} ...`。",
                     idempotency_key=f"approval-needs-answer:{item.message.message_id}",
+                    reply_to_message_id=item.message.message_id,
                 )
                 self.db.complete_incoming(item.message.message_id)
                 return True
@@ -3782,6 +3815,7 @@ class BridgeService:
                 "answer": "✅ 回答已提交。",
             }[action],
             idempotency_key=f"approval-result:{item.message.message_id}",
+            reply_to_message_id=item.message.message_id,
         )
         return True
 
@@ -3800,6 +3834,7 @@ class BridgeService:
                 item.message.chat_id,
                 "该文件发送请求不存在、已处理或不属于这个会话。",
                 idempotency_key=f"artifact-stale:{item.message.message_id}",
+                reply_to_message_id=item.message.message_id,
             )
             self.db.complete_incoming(item.message.message_id)
             return True
@@ -3834,6 +3869,7 @@ class BridgeService:
             item.message.chat_id,
             reply,
             idempotency_key=f"artifact-result:{item.message.message_id}",
+            reply_to_message_id=item.message.message_id,
         )
         return True
 

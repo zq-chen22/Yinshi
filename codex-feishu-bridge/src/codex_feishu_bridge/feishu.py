@@ -21,6 +21,9 @@ from lark_oapi.api.im.v1 import (
     CreateImageRequestBody,
     CreateMessageRequest,
     CreateMessageRequestBody,
+    GetMessageRequest,
+    ReplyMessageRequest,
+    ReplyMessageRequestBody,
     GetMessageResourceRequest,
     ListChatRequest,
     ListMessageRequest,
@@ -44,7 +47,19 @@ IMAGE_FILE_SUFFIXES = frozenset({".bmp", ".gif", ".jpeg", ".jpg", ".png", ".tif"
 
 
 class FeishuAPIError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, code: int | None = None):
+        super().__init__(message)
+        self.code = code
+
+
+def _reply_target_unavailable(error: FeishuAPIError) -> bool:
+    # Transport/5xx/rate-limit failures must remain retryable, not cause a
+    # second, unquoted send after an ambiguous successful reply.
+    text = str(error).casefold()
+    return error.code == 230011 or (
+        error.code == 230001 and "message_id" in text
+        and any(word in text for word in ("invalid", "not found", "not exist"))
+    )
 
 
 def deterministic_uuid(namespace: str, value: str) -> str:
@@ -166,6 +181,7 @@ class FeishuGateway:
         *,
         receive_id_type: ReceiveIdType = "chat_id",
         idempotency_key: str | None = None,
+        reply_to_message_id: str | None = None,
     ) -> str:
         return await self.send_message(
             role,
@@ -174,6 +190,7 @@ class FeishuGateway:
             {"text": _utf8_head(text, 120000)},
             receive_id_type=receive_id_type,
             idempotency_key=idempotency_key,
+            reply_to_message_id=reply_to_message_id,
         )
 
     async def send_card(
@@ -184,6 +201,7 @@ class FeishuGateway:
         *,
         receive_id_type: ReceiveIdType = "chat_id",
         idempotency_key: str | None = None,
+        reply_to_message_id: str | None = None,
     ) -> str:
         return await self.send_message(
             role,
@@ -192,6 +210,7 @@ class FeishuGateway:
             card,
             receive_id_type=receive_id_type,
             idempotency_key=idempotency_key,
+            reply_to_message_id=reply_to_message_id,
         )
 
     async def send_message(
@@ -203,9 +222,37 @@ class FeishuGateway:
         *,
         receive_id_type: ReceiveIdType = "chat_id",
         idempotency_key: str | None = None,
+        reply_to_message_id: str | None = None,
     ) -> str:
         client = self._client(role)
         key = idempotency_key or secrets.token_hex(16)
+        if reply_to_message_id and not re.fullmatch(r"om_[A-Za-z0-9_]+", reply_to_message_id):
+            reply_to_message_id = None  # Synthetic card-action IDs are not Feishu messages.
+        if reply_to_message_id:
+            if receive_id_type != "chat_id":
+                raise FeishuAPIError("native replies require the source conversation chat_id")
+            if await self._reply_parent_available(role, receive_id, reply_to_message_id):
+                request = (
+                    ReplyMessageRequest.builder().message_id(reply_to_message_id)
+                    .request_body(ReplyMessageRequestBody.builder()
+                        .msg_type(msg_type)
+                        .content(json.dumps(content, ensure_ascii=False, separators=(",", ":")))
+                        .reply_in_thread(False)
+                        .uuid(deterministic_uuid("message", key)).build()).build()
+                )
+                try:
+                    response = await self._api_call(
+                        role, f"message.reply.{msg_type}", client.im.v1.message.areply(request)
+                    )
+                except FeishuAPIError as error:
+                    if not _reply_target_unavailable(error):
+                        raise
+                    self._reply_targets[(role, reply_to_message_id)] = (receive_id, False)
+                else:
+                    message_id = getattr(response.data, "message_id", None)
+                    if not message_id:
+                        raise FeishuAPIError("Feishu reply succeeded without a message_id")
+                    return str(message_id)
         body = (
             CreateMessageRequestBody.builder()
             .receive_id(receive_id)
@@ -227,6 +274,34 @@ class FeishuGateway:
         if not message_id:
             raise FeishuAPIError("Feishu send succeeded without a message_id")
         return str(message_id)
+
+    async def _reply_parent_available(self, role: AppRole, chat_id: str, message_id: str) -> bool:
+        cache = getattr(self, "_reply_targets", None)
+        if cache is None:
+            self._reply_targets = cache = {}
+        key = (role, message_id)
+        if key not in cache:
+            request = GetMessageRequest.builder().message_id(message_id).build()
+            try:
+                response = await self._api_call(
+                    role, "message.reply.source", self._client(role).im.v1.message.aget(request)
+                )
+            except FeishuAPIError as error:
+                if not _reply_target_unavailable(error):
+                    raise
+                parent_chat, available = chat_id, False
+            else:
+                items = response.data.items or []
+                parent = items[0] if items else None
+                parent_chat = str(getattr(parent, "chat_id", chat_id))
+                available = parent is not None and not bool(getattr(parent, "deleted", False))
+            if len(cache) >= 1024:
+                cache.pop(next(iter(cache)))
+            cache[key] = (parent_chat, available)
+        parent_chat, available = cache[key]
+        if parent_chat != chat_id:
+            raise FeishuAPIError("reply target does not belong to the destination conversation")
+        return available
 
     async def patch_card(self, role: AppRole, message_id: str, card: dict[str, Any]) -> None:
         request = (
@@ -413,6 +488,7 @@ class FeishuGateway:
         path: Path,
         *,
         idempotency_key: str,
+        reply_to_message_id: str | None = None,
     ) -> str:
         candidate = path.expanduser()
         if candidate.is_symlink():
@@ -443,6 +519,7 @@ class FeishuGateway:
                 "image",
                 {"image_key": response.data.image_key},
                 idempotency_key=idempotency_key,
+                reply_to_message_id=reply_to_message_id,
             )
         file_type = "mp4" if real.suffix.lower() == ".mp4" else "stream"
         with real.open("rb") as handle:
@@ -464,6 +541,7 @@ class FeishuGateway:
             "media" if file_type == "mp4" else "file",
             {"file_key": response.data.file_key},
             idempotency_key=idempotency_key,
+            reply_to_message_id=reply_to_message_id,
         )
 
     def _client(self, role: AppRole) -> Any:
@@ -493,7 +571,8 @@ class FeishuGateway:
         log_id = response.get_log_id() if hasattr(response, "get_log_id") else ""
         raise FeishuAPIError(
             f"Feishu {operation} failed: code={getattr(response, 'code', '?')} "
-            f"msg={getattr(response, 'msg', '')} log_id={log_id}"
+            f"msg={getattr(response, 'msg', '')} log_id={log_id}",
+            code=getattr(response, "code", None),
         )
 
 
