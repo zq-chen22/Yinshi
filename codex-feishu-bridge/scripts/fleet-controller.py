@@ -23,19 +23,32 @@ def command(node, argv, *, timeout=120, capture=True):
 
 
 BOOTSTRAP = r'''
-import hashlib,json,pathlib,subprocess,sys
+import hashlib,json,pathlib,runpy,shutil,subprocess,sys,tempfile
 node=json.loads(sys.argv[1]); request=json.loads(sys.argv[2])
 home=pathlib.Path(node['home']);state=home/'.local/share/codex-feishu-bridge'
 stage=state/'fleet-artifacts'/request['sha'];bare=state/'yinshi.git';release=state/'releases'/request['sha']
-for path,digest in json.loads((stage/'checksums.json').read_text()).items():
+checksums=json.loads((stage/'checksums.json').read_text())
+for path,digest in checksums.items():
     file=stage/path
+    if not file.resolve().is_relative_to(stage.resolve()):raise RuntimeError('artifact path escapes stage')
     if hashlib.sha256(file.read_bytes()).hexdigest()!=digest:raise RuntimeError('artifact checksum mismatch: '+path)
-cli=home/'.codex/packages/standalone/releases'/(request['codex_version']+'-yinshi-'+request['sha'][:12])
+validator=stage/'codex_runtime_check.py'
+if not validator.is_file() or 'codex_runtime_check.py' not in checksums:raise RuntimeError('artifact lacks mandatory runtime validator; rebuild the release kit')
+check_runtime=runpy.run_path(str(validator))['check_package']
+staged_runtime=check_runtime(stage/'codex',request['codex_version'])
+if any('codex/'+path not in checksums for path in staged_runtime['files']):raise RuntimeError('runtime files missing from artifact checksums')
+cli=(home/'.local/bin/codex').resolve().parent.parent if request.get('preserve_codex_runtime') is True else home/'.codex/packages/standalone/releases'/(request['codex_version']+'-yinshi-'+request['sha'][:12])
+if request.get('preserve_codex_runtime') is True and not (cli/'bin/codex').is_file():raise RuntimeError('bridge-only release requires the existing complete runtime')
 if not cli.exists():
-    import shutil
-    cli.parent.mkdir(parents=True,exist_ok=True);shutil.copytree(stage/'codex',cli)
-bin=home/'.local/bin/codex';bin.parent.mkdir(parents=True,exist_ok=True)
-temporary=bin.with_name('codex.yinshi-next');temporary.unlink(missing_ok=True);temporary.symlink_to(cli/'bin/codex');temporary.replace(bin)
+    cli.parent.mkdir(parents=True,exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='yinshi-cli-',dir=cli.parent) as temporary:
+        candidate=pathlib.Path(temporary)/'package';shutil.copytree(stage/'codex',candidate)
+        if check_runtime(candidate,request['codex_version'])['files']!=staged_runtime['files']:raise RuntimeError('copied runtime differs from verified artifact')
+        candidate.replace(cli)
+if check_runtime(cli,request['codex_version'])['files']!=staged_runtime['files']:raise RuntimeError('installed runtime differs from verified artifact; refusing stale cache')
+if request.get('preserve_codex_runtime') is not True:
+    bin=home/'.local/bin/codex';bin.parent.mkdir(parents=True,exist_ok=True)
+    temporary=bin.with_name('codex.yinshi-next');temporary.unlink(missing_ok=True);temporary.symlink_to(cli/'bin/codex');temporary.replace(bin)
 if not bare.exists():subprocess.run(['git','clone','--bare',str(stage/'source.bundle'),str(bare)],check=True,stdout=subprocess.DEVNULL)
 else:subprocess.run(['git','-C',str(bare),'fetch',str(stage/'source.bundle'),'+refs/heads/*:refs/heads/*','refs/tags/*:refs/tags/*'],check=True,stdout=subprocess.DEVNULL)
 subprocess.run(['git','-C',str(bare),'remote','set-url','origin','https://github.com/zq-chen22/Yinshi.git'],check=True)
@@ -44,7 +57,7 @@ root=release/'codex-feishu-bridge';venv=root/'.venv'
 if not (venv/'bin/python').exists():subprocess.run([node['python'],'-m','venv',str(venv)],check=True)
 wheel=next((stage/'wheelhouse').glob('codex_feishu_bridge-'+request['bridge_version']+'-*.whl'))
 subprocess.run([str(venv/'bin/python'),'-m','pip','install','--no-index','--find-links',str(stage/'wheelhouse'),str(wheel)],check=True,stdout=subprocess.DEVNULL)
-request['release_dir']=str(release);request['codex_bin']=str(home/'.local/bin/codex')
+request['release_dir']=str(release);request['codex_bin']=str(cli/'bin/codex')
 req=state/'deployment-request.json';tmp=req.with_suffix('.tmp');tmp.write_text(json.dumps(request,indent=2)+'\n');tmp.chmod(0o600);tmp.replace(req)
 unit=home/'.config/systemd/user';unit.mkdir(parents=True,exist_ok=True)
 (unit/'codex-feishu-release-activate.service').write_text('[Unit]\nDescription=Activate promoted Yinshi release only when idle\n[Service]\nType=oneshot\nEnvironment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin\nEnvironmentFile=-%h/.config/codex-feishu-bridge/secrets.env\nExecStart="'+str(venv/'bin/python')+'" -m codex_feishu_bridge.fleet activate\nTimeoutStartSec=21760\nUMask=0077\n')
@@ -101,6 +114,9 @@ def main():
     tag = channel["tag"]
     sha = subprocess.check_output(["git", "-C", str(args.repo), "rev-parse", tag + "^{commit}"], text=True).strip()
     request = {**channel, "sha": sha, "policy": inventory["policy"], "policy_revision": inventory["policy_revision"]}
+    for flag in ("preserve_codex_runtime", "preserve_runtime_settings"):
+        if flag in inventory:
+            request[flag] = inventory[flag]
     results = []
     for node in inventory["nodes"]:
         status = node_status(node)

@@ -10,6 +10,8 @@ import shutil
 import subprocess
 import zipfile
 
+from codex_runtime_check import check_package
+
 
 def main() -> int:
     p = argparse.ArgumentParser()
@@ -24,11 +26,11 @@ def main() -> int:
     channel = json.loads(subprocess.check_output(git + ["show", f"{sha}:deploy/stable.json"], text=True))
     if channel["tag"] != args.tag:
         raise ValueError("tag differs from the promoted channel")
-    version = subprocess.check_output([str(args.cli_package / "bin/codex"), "--version"], text=True).strip().split()[-1]
-    if version != channel["codex_version"]:
-        raise ValueError("CLI package version differs from release")
-    if not (args.cli_package / "codex-package.json").is_file():
-        raise ValueError("not a standalone Codex package; never pass CODEX_HOME")
+    runtime = check_package(args.cli_package, channel["codex_version"])
+    validator = Path(__file__).with_name("codex_runtime_check.py")
+    committed_validator = subprocess.check_output(git + ["show", f"{sha}:codex-feishu-bridge/scripts/codex_runtime_check.py"])
+    if validator.read_bytes() != committed_validator:
+        raise ValueError("runtime validator differs from committed release")
     wheels = list(args.wheelhouse.glob(f"codex_feishu_bridge-{channel['bridge_version']}-*.whl"))
     if len(wheels) != 1:
         raise ValueError("exactly one matching bridge wheel is required")
@@ -44,10 +46,16 @@ def main() -> int:
     if output.exists():
         raise ValueError("artifact already exists; immutable releases must not be overwritten")
     output.mkdir(parents=True, mode=0o700)
-    branch = subprocess.check_output(git + ["symbolic-ref", "--short", "HEAD"], text=True).strip()
-    subprocess.run(git + ["bundle", "create", str(output / "source.bundle"), args.tag, branch], check=True)
+    references = [args.tag]
+    branch = subprocess.run(git + ["symbolic-ref", "--short", "HEAD"], capture_output=True, text=True)
+    if branch.returncode == 0:
+        references.append(branch.stdout.strip())
+    subprocess.run(git + ["bundle", "create", str(output / "source.bundle"), *references], check=True)
     shutil.copytree(args.wheelhouse, output / "wheelhouse")
     shutil.copytree(args.cli_package, output / "codex")
+    shutil.copy2(validator, output / "codex_runtime_check.py")
+    if check_package(output / "codex", channel["codex_version"])["files"] != runtime["files"]:
+        raise ValueError("runtime package changed while building artifacts")
     checksums = {
         str(path.relative_to(output)): hashlib.sha256(path.read_bytes()).hexdigest()
         for path in sorted(output.rglob("*")) if path.is_file()

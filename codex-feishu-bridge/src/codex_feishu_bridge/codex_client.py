@@ -486,6 +486,9 @@ class CodexAppServer:
     async def interrupt_turn(self, thread_id: str, turn_id: str) -> None:
         await self.request("turn/interrupt", {"threadId": thread_id, "turnId": turn_id})
 
+    async def read_rate_limits(self) -> dict[str, Any]:
+        return await self.request("account/rateLimits/read")
+
     async def quota(self) -> dict[str, Any]:
         rate_limits, usage = await asyncio.gather(
             self.request("account/rateLimits/read"),

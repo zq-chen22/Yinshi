@@ -13,6 +13,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
+from .account_status import AccountQuotaStatus
 from .artifacts import ArtifactBroker
 from .codex_client import (
     CodexAppServer,
@@ -87,6 +88,9 @@ class BridgeService:
         self.db = db
         self.codex = codex
         self.gateway = gateway
+        self._account_quota = AccountQuotaStatus(
+            lambda: self.codex.read_rate_limits(), timezone_name=config.daily_stats.timezone
+        )
         self.artifacts = ArtifactBroker(config, gateway)
         configure_threads = getattr(self.codex, "configure_thread_defaults", None)
         if callable(configure_threads):
@@ -1836,7 +1840,8 @@ class BridgeService:
             await self.gateway.send_text(
                 "conversation",
                 message.chat_id,
-                f"{status}；等待队列 {queue.qsize() if queue else 0} 条。",
+                f"{status}；等待队列 {queue.qsize() if queue else 0} 条。\n\n"
+                + await self._account_quota.render(),
                 idempotency_key=f"status:{message.message_id}",
                 reply_to_message_id=message.message_id,
             )
@@ -1893,6 +1898,7 @@ class BridgeService:
             "!权限": "权限",
             "/permissions": "权限",
             "/status": "状态",
+            "status": "状态",
             "!配置记录": "配置记录",
             "!设置记录": "设置记录",
             "!配置重置": "配置重置",
@@ -1901,6 +1907,8 @@ class BridgeService:
         kind = command_aliases.get(command.lower())
         if not kind:
             return False
+        if command.lower() == "status" and argument.strip():
+            return False
         binding = self.db.get_binding_by_chat(message.chat_id)
         if message.app_role == "conversation" and message.chat_type != "p2p" and not binding:
             return False
@@ -1908,7 +1916,7 @@ class BridgeService:
         argument = argument.strip()
         card: dict[str, Any] | None = None
 
-        if command.startswith("/") and self._runtime_compatibility_error:
+        if command.startswith("/") and self._runtime_compatibility_error and kind != "状态":
             reply = (
                 "⛔ Codex CLI 设置兼容门禁已触发，未写入任何设置。\n"
                 f"{self._runtime_compatibility_error}\n"
@@ -2319,7 +2327,8 @@ class BridgeService:
             f"• 推理：`{effort}`\n"
             f"• Fast：`{'on' if settings.service_tier == 'priority' else 'off'}`\n"
             f"• 权限：`{permission}`\n"
-            f"• 工作目录：`{cwd}`"
+            f"• 工作目录：`{cwd}`\n\n"
+            + await self._account_quota.render()
         )
 
     async def _probe_runtime_settings_compatibility(
@@ -2889,6 +2898,7 @@ class BridgeService:
                 f"发件箱：{self.db.outbox_counts() or {'empty': 0}}；长连接：{receivers}。\n"
                 f"本月桥内已记录飞书 API：{api_total} 次（{api_top}）。"
             )
+            reply += "\n\n" + await self._account_quota.render()
             await self._admin_reply(message, reply, "bridge-status")
             self.db.complete_incoming(message.message_id)
             return
@@ -3266,6 +3276,9 @@ class BridgeService:
 
     async def _on_codex_notification(self, message: dict[str, Any]) -> None:
         method = str(message.get("method") or "")
+        if method == "account/updated":
+            self._account_quota.invalidate()
+            return
         params = message.get("params") or {}
         thread_id = str(params.get("threadId") or "")
         turn_raw = params.get("turn") or {}

@@ -63,6 +63,8 @@ class FakeCodex:
         self.archived_threads: list[str] = []
         self.unsubscribed_threads: list[str] = []
         self.resumed_threads: list[dict[str, Any]] = []
+        self.rate_limit_reads = 0
+        self.rate_limits: dict[str, Any] = {}
         self.models = [
             {
                 "id": "gpt-test",
@@ -110,6 +112,10 @@ class FakeCodex:
 
     async def list_models(self) -> list[dict[str, Any]]:
         return self.models
+
+    async def read_rate_limits(self) -> dict[str, Any]:
+        self.rate_limit_reads += 1
+        return self.rate_limits
 
     async def update_thread_settings(self, thread_id: str, **kwargs: Any) -> dict[str, Any]:
         value = {"thread_id": thread_id, **kwargs}
@@ -353,6 +359,9 @@ class FakeGateway:
 
     def configured(self, role: AppRole) -> bool:
         return role in self.configured_roles
+
+    def receiver_status(self) -> dict[str, Any]:
+        return {}
 
     async def send_text(
         self,
@@ -2457,6 +2466,119 @@ async def test_runtime_command_does_not_consume_held_attachment(tmp_path: Path) 
 
         assert db.inbox_state(media.message_id) == "held"
         assert db.inbox_state("om-runtime-status") == "done"
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("command", "private"),
+    [
+        ("/status", False), ("status", False), ("STATUS", False), ("!status", False),
+        ("/status", True), ("status", True), ("STATUS", True), ("状态", True),
+    ],
+)
+async def test_status_reports_shared_account_quota_without_model_turns(
+    tmp_path: Path, command: str, private: bool
+) -> None:
+    config = make_config(tmp_path, owner_conversation_open_id="ou_conversation_owner")
+    db = BridgeDB(config.database_path)
+    codex = FakeCodex()
+    codex.rate_limits = {
+        "rateLimits": {
+            "limitId": "codex",
+            "primary": {"usedPercent": 90, "windowDurationMins": 10080, "resetsAt": 2000000000},
+        },
+        "rateLimitResetCredits": {"availableCount": 3, "credits": []},
+    }
+    gateway = FakeGateway()
+    service = BridgeService(config, db, codex, gateway)
+    if not private:
+        bind_thread(db)
+    message = incoming("status-account", text=command, create_time_ms=2_000)
+    if private:
+        message.chat_id = "oc_private"
+        message.chat_type = "p2p"
+    try:
+        await service._route_incoming(stage(db, message))
+        text = gateway.texts[-1]["text"]
+        assert "剩余 10%" in text
+        assert "下次重置" in text
+        assert "可用重置券：3张" in text
+        assert gateway.texts[-1]["reply_to_message_id"] == message.message_id
+        assert db.inbox_state(message.message_id) == "done"
+        assert codex.rate_limit_reads == 1
+        assert not codex.started_threads
+        assert not codex.setting_updates
+        assert not codex.interrupted
+        assert not service._thread_queues
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_status_is_readable_with_settings_gate_and_quota_failure(tmp_path: Path) -> None:
+    config = make_config(tmp_path, owner_conversation_open_id="ou_conversation_owner")
+    db = BridgeDB(config.database_path)
+    codex = FakeCodex()
+
+    async def unavailable():
+        raise RuntimeError("private-provider-error")
+
+    codex.read_rate_limits = unavailable
+    gateway = FakeGateway()
+    service = BridgeService(config, db, codex, gateway)
+    service._runtime_compatibility_error = "unverified CLI"
+    bind_thread(db)
+    try:
+        await service._route_incoming(stage(db, incoming("status-gated", text="/status")))
+        text = gateway.texts[-1]["text"]
+        assert "当前对话状态" in text
+        assert "• 模型" in text
+        assert "暂时无法读取" in text
+        assert "可用重置券：未知" in text
+        assert "private-provider-error" not in text
+        assert not codex.started_threads
+        await service._route_incoming(stage(db, incoming("model-still-gated", text="/model")))
+        assert "兼容门禁" in gateway.texts[-1]["text"]
+        assert not codex.setting_updates
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_status_cache_is_shared_across_conversations_and_cleared_on_account_change(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path, owner_conversation_open_id="ou_conversation_owner")
+    db = BridgeDB(config.database_path)
+    codex = FakeCodex()
+    service = BridgeService(config, db, codex, FakeGateway())
+    bind_thread(db)
+    bind_thread(db, thread_id="thread-2", chat_id="oc_other")
+    try:
+        await service._format_runtime_status("thread-1", db.get_binding_by_thread("thread-1"))
+        await service._format_runtime_status("thread-2", db.get_binding_by_thread("thread-2"))
+        assert codex.rate_limit_reads == 1
+        await service._on_codex_notification({"method": "account/updated", "params": {}})
+        await service._format_runtime_status("thread-1", db.get_binding_by_thread("thread-1"))
+        assert codex.rate_limit_reads == 2
+        assert not codex.started_threads
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_bare_status_with_additional_words_is_not_a_control_command(tmp_path: Path) -> None:
+    config = make_config(tmp_path, owner_conversation_open_id="ou_conversation_owner")
+    db = BridgeDB(config.database_path)
+    codex = FakeCodex()
+    service = BridgeService(config, db, codex, FakeGateway())
+    bind_thread(db)
+    try:
+        item = stage(db, incoming("status-question", text="status of our research"))
+        assert await service._try_runtime_command(item) is False
+        assert codex.rate_limit_reads == 0
     finally:
         db.close()
 

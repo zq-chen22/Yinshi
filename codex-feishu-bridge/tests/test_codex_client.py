@@ -262,6 +262,8 @@ async def test_jsonl_client_filters_threads_and_dispatches_events(tmp_path):
         assert approval_method == ["item/commandExecution/requestApproval"]
         assert client.pending_server_request(777) is None
 
+        rate_limits = await client.read_rate_limits()
+        assert rate_limits["primary"]["usedPercent"] == 12
         quota = await client.quota()
         assert quota["rate_limits"]["primary"]["usedPercent"] == 12
         assert quota["usage"]["plan"] == "test"

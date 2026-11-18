@@ -1,5 +1,18 @@
 # 多主机统一发布与无损迁移
 
+## 仅升级桥代码
+
+已完成模型策略迁移的节点，后续功能发布在私有inventory设置
+`preserve_runtime_settings = true` 和 `preserve_codex_runtime = true`（JSON使用布尔值）。
+前者保留全局及各对话模型、思考强度、Fast、权限和用户偏好，不重新应用旧迁移策略；
+后者核对当前完整CLI与构建包的版本和全量指纹一致，保留原CLI目录和链接。
+版本不匹配、组件缺失或执行宿主离线闭环失败时停止暂存，不冒充兼容。
+不要把这两个保留选项用于首次迁移或需要单独授权CLI升级的节点。
+
+构建支持detached工作树，仅凭不可变tag导出Git bundle，不要求创建临时分支。
+构建和暂存均校验完整官方runtime、代码宿主及资源，并执行不调用模型的JavaScript与嵌套工具往返；
+主二进制加手写manifest不能通过。暂存完成仍不等于服务已加载，必须排空后再核进程与status回复。
+
 唯一源码仓库为 `https://github.com/zq-chen22/Yinshi`。不要再从独立旧仓库部署，
 也不要在正在运行的 source 或 site-packages 中修改代码。正式运行包必须来自
 不可变 release tag，并记录完整 Git SHA、桥版本和 Codex CLI 版本。

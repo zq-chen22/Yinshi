@@ -192,6 +192,31 @@ def validate_units(root: Path, auxiliaries: dict[Path, str]) -> None:
             raise RuntimeError("systemd preflight emitted unit diagnostics")
 
 
+def activation_config_updates(request: dict) -> dict:
+    values = {"codex_bin": request["codex_bin"]}
+    if request.get("preserve_runtime_settings") is True:
+        return values
+    policy = request["policy"]
+    values.update({
+        "model": policy["model"],
+        "model_reasoning_effort": policy["effort"],
+        "new_thread_reasoning_effort": policy["effort"],
+        "service_tier": "priority",
+        "random_model": policy["random_model"],
+        "random_reasoning_effort": policy["random_effort"],
+        "random_service_tier": "priority",
+        "data_retention_days": 0,
+        "show_workspace_path": True,
+    })
+    return values
+
+
+def apply_deployment_policy(db: BridgeDB, request: dict) -> dict:
+    if request.get("preserve_runtime_settings") is True:
+        return {"runtime_settings_preserved": True}
+    return apply_policy(db, request["policy"], request["policy_revision"])
+
+
 def activate(request_path: Path) -> int:
     request = json.loads(request_path.read_text())
     sha = request["sha"]
@@ -258,20 +283,11 @@ def activate(request_path: Path) -> int:
             with sqlite3.connect(backup / "bridge.sqlite") as target:
                 source.backup(target)
         (backup / "bridge.sqlite").chmod(0o600)
-        update_bridge_config(CONFIG, {
-            "codex_bin": request["codex_bin"], "model": policy["model"],
-            "model_reasoning_effort": policy["effort"], "new_thread_reasoning_effort": policy["effort"],
-            "service_tier": "priority", "random_model": policy["random_model"],
-            "random_reasoning_effort": policy["random_effort"], "random_service_tier": "priority",
-            # Existing private installations keep history; do not introduce
-            # a new automatic deletion policy during migration.
-            "data_retention_days": 0,
-            "show_workspace_path": True,
-        })
+        update_bridge_config(CONFIG, activation_config_updates(request))
         updated = load_config(CONFIG)
         db = BridgeDB(updated.database_path)
         try:
-            policy_counts = apply_policy(db, policy, request["policy_revision"])
+            policy_counts = apply_deployment_policy(db, request)
         finally:
             db.close()
         root = release / "codex-feishu-bridge"
@@ -291,7 +307,11 @@ def activate(request_path: Path) -> int:
         atomic_json(marker, deployed)
         db = BridgeDB(updated.database_path)
         try:
-            enqueue_notice(db, updated, sha, f"✅ Yinshi 飞书桥统一部署完成\n版本 {request['bridge_version']} · {sha[:12]}\nCodex {request['codex_version']}\n普通对话：{policy['model']} / {policy['effort']} / Fast\nRandom：{policy['random_model']} / {policy['random_effort']} / Fast\n历史、配对及群绑定已保留。")
+            if request.get("preserve_runtime_settings") is True:
+                notice = f"✅ Yinshi 飞书桥部署完成\n版本 {request['bridge_version']} · {sha[:12]}\nCodex {request['codex_version']}\n各对话模型、思考强度、Fast、权限及全局偏好保持；历史、配对及群绑定已保留。"
+            else:
+                notice = f"✅ Yinshi 飞书桥统一部署完成\n版本 {request['bridge_version']} · {sha[:12]}\nCodex {request['codex_version']}\n普通对话：{policy['model']} / {policy['effort']} / Fast\nRandom：{policy['random_model']} / {policy['random_effort']} / Fast\n历史、配对及群绑定已保留。"
+            enqueue_notice(db, updated, sha, notice)
         finally:
             db.close()
         print(json.dumps(deployed, ensure_ascii=False))
