@@ -234,4 +234,3 @@ def test_actual_repaired_runtime_executes_without_model_api():
     if not (actual / "bin/codex-code-mode-host").is_file():
         pytest.skip("repaired local runtime is unavailable")
     assert runtime.check_package(actual, "0.164.0", hashes=False)["offline_tool_roundtrip"]
-
