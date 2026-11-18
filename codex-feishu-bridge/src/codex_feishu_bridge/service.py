@@ -36,6 +36,15 @@ from .models import (
     ThreadSummary,
     TurnJob,
 )
+from .model_profiles import (
+    PROFILE_LABELS,
+    PROFILE_SCOPE,
+    load_profiles,
+    profile_changes,
+    profile_command,
+    profile_for_scope,
+    validate_profile,
+)
 from .privacy import log_ref as _log_ref
 from .privacy import redact_log
 from .visual_proxy import build_codex_hook_config
@@ -349,8 +358,11 @@ class BridgeService:
             source_kind="appServer",
         )
         binding = self.db.upsert_thread(summary, title=clean_title)
+        profiles = load_profiles(self.db)
+        if len(profiles) == 2:
+            self.db.set_runtime_configs(profile_changes(thread_id, clean_title, "default", profiles), message_id=inbox_message_id or f"new-thread:{thread_id}")
         creation_effort = (
-            title_effort if "random" in clean_title.casefold()
+            title_effort if "random" in clean_title.casefold() or len(profiles) == 2
             else self.config.new_thread_reasoning_effort
         )
         if creation_effort:
@@ -409,6 +421,9 @@ class BridgeService:
         )
 
     async def _create_binding_chat(self, binding: Binding, owner: str) -> None:
+        profiles = load_profiles(self.db)
+        if len(profiles) == 2 and self.db.get_setting(f"runtime:{binding.thread_id}:model_profile") is None:
+            self.db.set_runtime_configs(profile_changes(binding.thread_id, binding.title, "default", profiles), message_id=f"new-binding:{binding.thread_id}")
         recovered = await self.gateway.find_conversation_chat(binding.thread_id, owner)
         if recovered:
             chat_id, actual_name = recovered
@@ -994,6 +1009,8 @@ class BridgeService:
         if await self._try_approval_command(item):
             return
         if await self._try_compatibility_command(item):
+            return
+        if await self._try_model_profile_command(item):
             return
         if await self._try_runtime_command(item):
             return
@@ -1882,6 +1899,88 @@ class BridgeService:
         self._merge_group_attachments(message)
         await self._queue_thread_message(item, binding)
 
+    async def _try_model_profile_command(self, item: InboxItem) -> bool:
+        message = item.message
+        parsed = profile_command(message.text.strip())
+        if parsed is None:
+            return False
+        command, argument = parsed
+        binding = self.db.get_binding_by_chat(message.chat_id)
+        if message.chat_type != "p2p" and not binding:
+            return False
+        scope = binding.thread_id if binding else "admin"
+        profiles = load_profiles(self.db)
+        targets = []
+        reply = ""
+        previous_reply = self.db.get_setting(f"runtime:model_profile_commands:{message.message_id}", "")
+        if previous_reply:
+            await self.gateway.send_text(message.app_role, message.chat_id, previous_reply, idempotency_key=f"model-profile:{message.message_id}", reply_to_message_id=message.message_id)
+            self.db.complete_incoming(message.message_id)
+            return True
+        try:
+            if command == "模型档位":
+                reply = "模型档位：\n" + "\n".join(
+                    f"• {PROFILE_LABELS[level]}：{profiles[level].model} / {profiles[level].effort}"
+                    if level in profiles else f"• {PROFILE_LABELS[level]}：未设置"
+                    for level in PROFILE_LABELS
+                ) + "\n口令：默认、高级、全部默认、全部高级。新对话默认；Random始终高级+Fast。"
+            else:
+                global_command = command.startswith("全部") or command.endswith("模型")
+                if global_command and message.sender_open_id != self._owner(message.app_role):
+                    raise ValueError("全局档位设置和全部切换仅允许已配对的桥管理员操作。")
+                if self._runtime_compatibility_error:
+                    raise ValueError("设置兼容门禁尚未通过，请先发送/compat检测并修复；本次未修改。")
+                models = await self.codex.list_models()
+                changes = []
+                bindings = [entry for entry in self.db.list_bindings() if entry.active and entry.chat_id]
+                scopes = [(entry.thread_id, entry.title, entry) for entry in bindings] + [("admin", "", None)]
+                if command.endswith("模型"):
+                    level = "default" if command == "默认模型" else "advanced"
+                    preset = validate_profile(argument, models, advanced=level == "advanced")
+                    profiles[level] = preset
+                    changes.append((PROFILE_SCOPE, level, preset.encode()))
+                    targets = [entry for entry in scopes if self.db.get_setting(f"runtime:{entry[0]}:model_profile", "default") == level or (level == "advanced" and "random" in entry[1].casefold())]
+                    if len(profiles) == 2:
+                        for target, title, _ in targets:
+                            target_level = "advanced" if "random" in title.casefold() else level
+                            changes.extend(profile_changes(target, title, target_level, profiles))
+                    else:
+                        targets = []
+                    reply = f"{PROFILE_LABELS[level]}模型已设为 {preset.model} / {preset.effort}。"
+                else:
+                    if len(profiles) != 2:
+                        raise ValueError("请先设置默认模型和高级模型，例如：默认模型 gpt-6.2-sol xhigh；高级模型 gpt-6.2-astra max。")
+                    level = "default" if command.endswith("默认") else "advanced"
+                    targets = scopes if command.startswith("全部") else [(scope, binding.title if binding else "", binding)]
+                    for target, title, _ in targets:
+                        target_level = "advanced" if "random" in title.casefold() else level
+                        preset = profiles[target_level]
+                        validate_profile(f"{preset.model} {preset.effort}", models, advanced=target_level == "advanced")
+                        changes.extend(profile_changes(target, title, target_level, profiles))
+                    reply = f"已保存{command}设置；普通对话Fast关闭，Random固定高级+Fast。"
+                changes.append(("model_profile_commands", message.message_id, reply))
+                self.db.set_runtime_configs(changes, message_id=message.message_id)
+                immediate = pending = 0
+                for target, _, target_binding in targets:
+                    try:
+                        applied = False if target == "admin" and self._admin_worker_job is not None else await self._apply_runtime_if_idle(target_binding, target)
+                    except Exception:
+                        applied = False
+                    if applied:
+                        immediate += 1
+                    else:
+                        pending += 1
+                if targets:
+                    reply += f" 立即应用{immediate}个作用域；{pending}个活动或暂不可用作用域在后续轮次生效，未中断任务。"
+                self.db.set_runtime_config("model_profile_commands", message.message_id, reply, message_id=message.message_id)
+        except ValueError as error:
+            reply = str(error)
+        except (CodexRPCError, TimeoutError, RuntimeError):
+            reply = "模型目录或CLI暂时不可用，本次未修改档位；请稍后重试。"
+        await self.gateway.send_text(message.app_role, message.chat_id, reply, idempotency_key=f"model-profile:{message.message_id}", reply_to_message_id=message.message_id)
+        self.db.complete_incoming(message.message_id)
+        return True
+
     async def _try_runtime_command(self, item: InboxItem) -> bool:
         message = item.message
         text = message.text.strip()
@@ -1915,6 +2014,23 @@ class BridgeService:
         scope = binding.thread_id if binding else "admin"
         argument = argument.strip()
         card: dict[str, Any] | None = None
+
+        if profile_for_scope(self.db, scope, binding.title if binding else "") is not None and not (binding and "random" in binding.title.casefold()) and (
+            kind == "快速" or (kind == "速度" and argument.casefold() in {"快速", "fast", "priority", "on"})
+        ):
+            reply = "默认/高级档位均使用普通速度，仅Random固定Fast；本次未开启Fast。"
+            await self.gateway.send_text(message.app_role, message.chat_id, reply, idempotency_key=f"normal-profile-standard:{message.message_id}", reply_to_message_id=message.message_id)
+            self.db.complete_incoming(message.message_id)
+            return True
+
+        if binding and "random" in binding.title.casefold() and len(load_profiles(self.db)) == 2 and (
+            (kind in {"模型", "推理", "速度"} and argument)
+            or kind in {"快速", "配置重置", "设置重置"}
+        ):
+            reply = "Random始终使用高级模型+Fast；请用“高级模型 模型名 思考强度”更新高级定义。权限设置不受影响。"
+            await self.gateway.send_text(message.app_role, message.chat_id, reply, idempotency_key=f"random-profile-locked:{message.message_id}", reply_to_message_id=message.message_id)
+            self.db.complete_incoming(message.message_id)
+            return True
 
         if command.startswith("/") and self._runtime_compatibility_error and kind != "状态":
             reply = (
@@ -1958,6 +2074,9 @@ class BridgeService:
         elif kind in {"配置重置", "设置重置"}:
             for name in ("model", "effort", "service_tier", "approval_policy", "sandbox"):
                 self.db.set_runtime_config(scope, name, "", message_id=message.message_id)
+            profiles = load_profiles(self.db)
+            if len(profiles) == 2:
+                self.db.set_runtime_configs(profile_changes(scope, binding.title if binding else "", "default", profiles), message_id=message.message_id)
             applied = await self._apply_runtime_if_idle(binding, scope)
             reply = "已重置为桥接默认配置。" + ("" if applied else " 当前任务结束后生效。")
         elif kind == "模型":
@@ -2005,6 +2124,8 @@ class BridgeService:
                                 ),
                                 message_id=message.message_id,
                             )
+                        if len(load_profiles(self.db)) == 2:
+                            self.db.set_runtime_config(scope, "model_profile", "", message_id=message.message_id)
                         applied = await self._apply_runtime_if_idle(binding, scope)
                         suffix = "" if applied else " 当前任务结束后生效。"
                         if requested_effort is None and efforts:
@@ -2094,6 +2215,8 @@ class BridgeService:
             else:
                 value = aliases[argument.lower()]
                 self.db.set_runtime_config(scope, "effort", value, message_id=message.message_id)
+                if len(load_profiles(self.db)) == 2:
+                    self.db.set_runtime_config(scope, "model_profile", "", message_id=message.message_id)
                 applied = await self._apply_runtime_if_idle(binding, scope)
                 reply = f"推理档位已设为 `{value}`。" + ("" if applied else " 当前任务结束后生效。")
         else:
@@ -2257,6 +2380,14 @@ class BridgeService:
         default_model, default_effort, default_tier = self._title_defaults(
             binding.title if is_random else ""
         )
+        profile = profile_for_scope(self.db, scope, binding.title if binding else "")
+        if profile is not None:
+            _, preset = profile
+            model, effort = preset.model, preset.effort
+            if is_random:
+                service_tier = "priority"
+            else:
+                service_tier = RUNTIME_SERVICE_TIER_OFF
         selected_approval = approval_policy or self.config.approval_policy
         selected_sandbox = sandbox or self.config.sandbox
         if (
@@ -2283,6 +2414,11 @@ class BridgeService:
         )
 
     def _title_defaults(self, title: str) -> tuple[str | None, str | None, str | None]:
+        profiles = load_profiles(self.db)
+        if len(profiles) == 2:
+            level = "advanced" if "random" in title.casefold() else "default"
+            preset = profiles[level]
+            return preset.model, preset.effort, "priority" if level == "advanced" else None
         if "random" in title.casefold():
             return (
                 self.config.random_model or self.config.model,
@@ -2320,8 +2456,10 @@ class BridgeService:
         target = "私聊临时任务" if scope == "admin" else "当前对话"
         version = getattr(self.codex, "cli_version", None) or "未知"
         cwd = binding.cwd if binding else str(self.config.admin_scratch_dir)
+        profile = profile_for_scope(self.db, scope, binding.title if binding else "")
+        profile_text = f"• 模型档位：{PROFILE_LABELS[profile[0]] if profile else '自定义'}\n" if len(load_profiles(self.db)) == 2 else ""
         return (
-            f"{target}状态：\n"
+            f"{target}状态：\n{profile_text}"
             f"• Codex CLI：`{version}`\n"
             f"• 模型：`{model_name}`\n"
             f"• 推理：`{effort}`\n"
@@ -2392,6 +2530,11 @@ class BridgeService:
             for model in models
         ):
             raise ValueError("model/list 返回的能力目录缺少设置字段")
+        profiles = load_profiles(self.db)
+        if len(profiles) == 2:
+            for level, preset in profiles.items():
+                validate_profile(f"{preset.model} {preset.effort}", models, advanced=level == "advanced")
+            return
         if self.config.random_model:
             random = _selected_model(models, self.config.random_model)
             if not random or self.config.random_model not in {random.get("id"), random.get("model")}:
@@ -2439,12 +2582,13 @@ class BridgeService:
             )
 
     async def _exercise_runtime_settings_protocol(self) -> None:
+        model, effort, tier = self._title_defaults("")
         thread = await self.codex.start_thread(
             cwd=str(self.config.admin_scratch_dir),
             approval_policy=self.config.approval_policy,
             sandbox=self.config.sandbox,
-            model=self.config.model,
-            service_tier=self.config.service_tier,
+            model=model,
+            service_tier=tier,
             ephemeral=True,
         )
         thread_id = str(thread.get("id") or "")
@@ -2455,12 +2599,11 @@ class BridgeService:
                 thread_id,
                 approval_policy=self.config.approval_policy,
                 sandbox=self.config.sandbox,
-                model=self.config.model,
+                model=model,
                 effort=(
-                    self.config.new_thread_reasoning_effort
-                    or self.config.model_reasoning_effort
+                    effort if len(load_profiles(self.db)) == 2 else self.config.new_thread_reasoning_effort or self.config.model_reasoning_effort
                 ),
-                service_tier=self.config.service_tier,
+                service_tier=tier,
             )
         finally:
             with contextlib.suppress(Exception):

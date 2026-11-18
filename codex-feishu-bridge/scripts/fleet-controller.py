@@ -46,9 +46,6 @@ if not cli.exists():
         if check_runtime(candidate,request['codex_version'])['files']!=staged_runtime['files']:raise RuntimeError('copied runtime differs from verified artifact')
         candidate.replace(cli)
 if check_runtime(cli,request['codex_version'])['files']!=staged_runtime['files']:raise RuntimeError('installed runtime differs from verified artifact; refusing stale cache')
-if request.get('preserve_codex_runtime') is not True:
-    bin=home/'.local/bin/codex';bin.parent.mkdir(parents=True,exist_ok=True)
-    temporary=bin.with_name('codex.yinshi-next');temporary.unlink(missing_ok=True);temporary.symlink_to(cli/'bin/codex');temporary.replace(bin)
 if not bare.exists():subprocess.run(['git','clone','--bare',str(stage/'source.bundle'),str(bare)],check=True,stdout=subprocess.DEVNULL)
 else:subprocess.run(['git','-C',str(bare),'fetch',str(stage/'source.bundle'),'+refs/heads/*:refs/heads/*','refs/tags/*:refs/tags/*'],check=True,stdout=subprocess.DEVNULL)
 subprocess.run(['git','-C',str(bare),'remote','set-url','origin','https://github.com/zq-chen22/Yinshi.git'],check=True)
@@ -114,7 +111,7 @@ def main():
     tag = channel["tag"]
     sha = subprocess.check_output(["git", "-C", str(args.repo), "rev-parse", tag + "^{commit}"], text=True).strip()
     request = {**channel, "sha": sha, "policy": inventory["policy"], "policy_revision": inventory["policy_revision"]}
-    for flag in ("preserve_codex_runtime", "preserve_runtime_settings"):
+    for flag in ("preserve_codex_runtime", "preserve_runtime_settings", "model_profiles", "initial_model_profile", "model_profile_revision"):
         if flag in inventory:
             request[flag] = inventory[flag]
     results = []

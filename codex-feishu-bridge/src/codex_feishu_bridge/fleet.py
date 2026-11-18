@@ -20,6 +20,7 @@ from .codex_client import CodexAppServer
 from .config import load_config
 from .db import BridgeDB
 from .models import OutboxItem
+from .model_profiles import initialize_profiles
 
 STATE = Path.home() / ".local/share/codex-feishu-bridge"
 CONFIG = Path.home() / ".config/codex-feishu-bridge/config.toml"
@@ -68,7 +69,7 @@ def update_bridge_config(path: Path, values: dict) -> None:
     os.replace(temporary, path)
 
 
-async def verify_catalog(codex_bin: str, policy: dict) -> dict:
+async def verify_catalog(codex_bin: str, policy: dict, *, profile_mode: bool = False) -> dict:
     # The node may need a local proxy that is configured on its main unit.
     # Reuse it in memory only; do not log, persist, or transfer its values.
     names = {"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
@@ -78,23 +79,24 @@ async def verify_catalog(codex_bin: str, policy: dict) -> dict:
            for key, value in [item.split("=", 1)] if key in names}
     async with CodexAppServer(codex_bin, request_timeout=45, env=env) as client:
         models = await client.list_models()
-        for name, effort in [(policy["model"], policy["effort"]),
-                             (policy["random_model"], policy["random_effort"])]:
+        for index, (name, effort) in enumerate([(policy["model"], policy["effort"]),
+                             (policy["random_model"], policy["random_effort"])]):
             model = next((m for m in models if name in (m.get("id"), m.get("model"))), None)
             if not model:
                 raise ValueError(f"requested model unavailable: {name}")
             efforts = [e["reasoningEffort"] for e in model.get("supportedReasoningEfforts", [])]
             tiers = [t["id"] for t in model.get("serviceTiers", [])]
-            if effort not in efforts or "priority" not in tiers:
+            tier = None if profile_mode and index == 0 else "priority"
+            if effort not in efforts or (tier and tier not in tiers):
                 raise ValueError(f"requested effort/Fast unavailable for {name}: {effort}")
             thread = await client.start_thread(
                 cwd=str(Path.home()), approval_policy="on-request", sandbox="read-only",
-                model=name, service_tier="priority", ephemeral=True,
+                model=name, service_tier=tier, ephemeral=True,
             )
             try:
                 await client.update_thread_settings(
                     thread["id"], approval_policy="on-request", sandbox="read-only",
-                    model=name, effort=effort, service_tier="priority",
+                    model=name, effort=effort, service_tier=tier,
                 )
             finally:
                 await client.unsubscribe_thread(thread["id"])
@@ -243,7 +245,11 @@ def activate(request_path: Path) -> int:
         print("new work arrived; deferred")
         return 0
     policy = request["policy"]
-    probe = asyncio.run(verify_catalog(request["codex_bin"], policy))
+    if request.get("model_profiles"):
+        expected = {"default": {"model": policy["model"], "effort": policy["effort"]}, "advanced": {"model": policy["random_model"], "effort": policy["random_effort"]}}
+        if request["model_profiles"] != expected:
+            raise ValueError("model-profile definitions differ from the verified catalog policy")
+    probe = asyncio.run(verify_catalog(request["codex_bin"], policy, profile_mode=bool(request.get("model_profiles"))))
     if probe["cli_version"] != request["codex_version"]:
         raise ValueError("Codex version differs from the promoted release")
     if importlib.metadata.version("codex-feishu-bridge") != request["bridge_version"]:
@@ -259,6 +265,8 @@ def activate(request_path: Path) -> int:
     validate_units(release / "codex-feishu-bridge", auxiliaries)
     original_auxiliaries = {p: p.read_text() if p.exists() else None for p in auxiliaries}
     original_config = CONFIG.read_text()
+    cli_link = Path.home() / ".local/bin/codex"
+    original_cli_link = os.readlink(cli_link) if cli_link.is_symlink() else None
     shutil.copy2(CONFIG, backup / "config.toml")
     (backup / "config.toml").chmod(0o600)
     atomic_json(backup / "previous.json", {"deployment": previous, "dropin": original_dropin,
@@ -288,6 +296,10 @@ def activate(request_path: Path) -> int:
         db = BridgeDB(updated.database_path)
         try:
             policy_counts = apply_deployment_policy(db, request)
+            if request.get("model_profiles"):
+                policy_counts["model_profiles"] = initialize_profiles(
+                    db, request["model_profiles"], level=request.get("initial_model_profile", "default"), revision=request["model_profile_revision"]
+                )
         finally:
             db.close()
         root = release / "codex-feishu-bridge"
@@ -302,12 +314,18 @@ def activate(request_path: Path) -> int:
         subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
         subprocess.run(["systemctl", "--user", "start", UNIT], check=True)
         wait_loaded_release(root)
+        if request.get("preserve_codex_runtime") is not True:
+            temporary_cli_link = cli_link.with_name(f"codex.activate-{os.getpid()}")
+            temporary_cli_link.symlink_to(request["codex_bin"])
+            os.replace(temporary_cli_link, cli_link)
         deployed = {k: request[k] for k in ["sha", "tag", "bridge_version", "codex_version", "policy_revision", "policy"]}
         deployed.update({"repository": "https://github.com/zq-chen22/Yinshi", "activated_at": int(time.time()), "release_dir": str(release), "policy_counts": policy_counts})
         atomic_json(marker, deployed)
         db = BridgeDB(updated.database_path)
         try:
-            if request.get("preserve_runtime_settings") is True:
+            if request.get("model_profiles"):
+                notice = f"✅ Yinshi 飞书桥{request['bridge_version']}已加载；双模型档位迁移已保存，正在进行原生兼容和口令验收。权限、历史、配对及群绑定保持。"
+            elif request.get("preserve_runtime_settings") is True:
                 notice = f"✅ Yinshi 飞书桥部署完成\n版本 {request['bridge_version']} · {sha[:12]}\nCodex {request['codex_version']}\n各对话模型、思考强度、Fast、权限及全局偏好保持；历史、配对及群绑定已保留。"
             else:
                 notice = f"✅ Yinshi 飞书桥统一部署完成\n版本 {request['bridge_version']} · {sha[:12]}\nCodex {request['codex_version']}\n普通对话：{policy['model']} / {policy['effort']} / Fast\nRandom：{policy['random_model']} / {policy['random_effort']} / Fast\n历史、配对及群绑定已保留。"
@@ -323,14 +341,21 @@ def activate(request_path: Path) -> int:
         subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
         subprocess.run(["systemctl", "--user", "stop", UNIT], check=False, timeout=21640)
         CONFIG.write_text(original_config)
+        if original_cli_link is not None:
+            rollback_link = cli_link.with_name(f"codex.rollback-{os.getpid()}")
+            rollback_link.symlink_to(original_cli_link)
+            os.replace(rollback_link, cli_link)
         CONFIG.chmod(0o600)
         with sqlite3.connect(cfg.database_path) as c:
             # Only undo our own latest setting events, not choices the user
             # may have made during the failed start attempt.
-            rows = c.execute("SELECT scope,name FROM runtime_config_events WHERE message_id=?", (f"fleet-policy:{request['policy_revision']}",)).fetchall()
+            mutation_ids = [f"fleet-policy:{request['policy_revision']}"]
+            if request.get("model_profile_revision"):
+                mutation_ids.append(f"model-profile-migration:{request['model_profile_revision']}")
+            rows = c.execute("SELECT scope,name FROM runtime_config_events WHERE message_id IN (" + ",".join("?" for _ in mutation_ids) + ")", mutation_ids).fetchall()
             for scope, name in rows:
                 latest = c.execute("SELECT message_id FROM runtime_config_events WHERE scope=? AND name=? ORDER BY id DESC LIMIT 1", (scope, name)).fetchone()
-                if not latest or latest[0] != f"fleet-policy:{request['policy_revision']}":
+                if not latest or latest[0] not in mutation_ids:
                     continue
                 key = f"runtime:{scope}:{name}"
                 if key in old_policy:

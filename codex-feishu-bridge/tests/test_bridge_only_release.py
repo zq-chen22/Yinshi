@@ -60,5 +60,5 @@ def test_legacy_release_policy_behavior_is_preserved(monkeypatch) -> None:
 def test_release_channel_keeps_verified_cli_version() -> None:
     root = Path(__file__).resolve().parents[2]
     channel = json.loads((root / "deploy/stable.json").read_text())
-    assert channel["bridge_version"] == "0.4.4"
-    assert channel["codex_version"] == "0.164.0"
+    assert channel["bridge_version"] == "0.4.5"
+    assert channel["codex_version"] == "0.170.0"

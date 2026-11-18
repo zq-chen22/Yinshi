@@ -286,27 +286,31 @@ class BridgeDB:
         return counts
 
     def set_runtime_config(self, scope: str, name: str, value: str, *, message_id: str) -> None:
-        key = f"runtime:{scope}:{name}"
+        self.set_runtime_configs([(scope, name, value)], message_id=message_id)
+
+    def set_runtime_configs(
+        self, changes: list[tuple[str, str, str]], *, message_id: str
+    ) -> None:
         now = int(time.time())
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
-                row = self._conn.execute(
-                    "SELECT value FROM settings WHERE key=?", (key,)
-                ).fetchone()
-                old_value = str(row["value"]) if row else None
-                self._conn.execute(
-                    """INSERT INTO settings(key, value, updated_at) VALUES(?, ?, ?)
-                       ON CONFLICT(key) DO UPDATE SET
-                       value=excluded.value, updated_at=excluded.updated_at""",
-                    (key, value, now),
-                )
-                self._conn.execute(
-                    """INSERT INTO runtime_config_events(
-                           scope, name, old_value, new_value, message_id, changed_at
-                       ) VALUES(?, ?, ?, ?, ?, ?)""",
-                    (scope, name, old_value, value, message_id, now),
-                )
+                for scope, name, value in changes:
+                    key = f"runtime:{scope}:{name}"
+                    row = self._conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+                    old_value = str(row["value"]) if row else None
+                    self._conn.execute(
+                        """INSERT INTO settings(key, value, updated_at) VALUES(?, ?, ?)
+                           ON CONFLICT(key) DO UPDATE SET
+                           value=excluded.value, updated_at=excluded.updated_at""",
+                        (key, value, now),
+                    )
+                    self._conn.execute(
+                        """INSERT INTO runtime_config_events(
+                               scope, name, old_value, new_value, message_id, changed_at
+                           ) VALUES(?, ?, ?, ?, ?, ?)""",
+                        (scope, name, old_value, value, message_id, now),
+                    )
                 self._conn.commit()
             except Exception:
                 self._conn.rollback()
