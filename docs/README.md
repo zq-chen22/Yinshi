@@ -42,6 +42,7 @@
 | [09-troubleshooting.md](09-troubleshooting.md) | 常见症状与逐层排查 |
 | [10-image-performance.md](10-image-performance.md) | 生图固有延迟、图片历史膨胀、受控实验和隔离工作流 |
 | [11-host-heartbeat-monitoring.md](11-host-heartbeat-monitoring.md) | 无自建服务器的主机/桥离线与恢复通知 |
+| [13-model-groups.md](13-model-groups.md) | Codex / Claude 切换、按对话维护日志、跨组原题独立回答 |
 | [SETUP_CHECKLIST.md](SETUP_CHECKLIST.md) | 可勾选的上线验收表 |
 
 ## 文档维护规则

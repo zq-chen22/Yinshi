@@ -26,7 +26,8 @@ def test_cli_reports_package_version(capsys: pytest.CaptureFixture[str]) -> None
         parser().parse_args(["--version"])
 
     assert exit_info.value.code == 0
-    assert "0.4.5" in capsys.readouterr().out
+    from codex_feishu_bridge import __version__
+    assert capsys.readouterr().out.strip().split()[-1] == __version__
 
 
 def test_verbose_logging_does_not_enable_third_party_debug() -> None:

@@ -99,6 +99,9 @@ class BridgeConfig:
     max_upload_bytes: int = 30 * 1024 * 1024
     feishu: FeishuConfig = field(default_factory=FeishuConfig)
     daily_stats: DailyStatsConfig = field(default_factory=DailyStatsConfig)
+    # Additional named groups using the same official Claude Code transport.
+    # Runtime secrets are private files, never TOML values or child argv.
+    group_definitions: dict = field(default_factory=dict)
 
     @property
     def visual_proxy_dir(self) -> Path:
@@ -175,6 +178,7 @@ def load_config(path: str | Path | None = None) -> BridgeConfig:
         admin_scratch_dir=_path(bridge.get("admin_scratch_dir"), state_dir / "admin-scratch"),
         managed_workspaces_dir=managed_workspaces_dir,
         codex_bin=str(bridge.get("codex_bin", "codex")),
+        group_definitions=raw.get("model_groups", {}),
         show_workspace_path=bool(bridge.get("show_workspace_path", False)),
         random_model=bridge.get("random_model") or None,
         random_reasoning_effort=bridge.get("random_reasoning_effort") or None,

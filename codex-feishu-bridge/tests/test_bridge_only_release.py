@@ -60,5 +60,8 @@ def test_legacy_release_policy_behavior_is_preserved(monkeypatch) -> None:
 def test_release_channel_keeps_verified_cli_version() -> None:
     root = Path(__file__).resolve().parents[2]
     channel = json.loads((root / "deploy/stable.json").read_text())
-    assert channel["bridge_version"] == "0.4.5"
+    import tomllib
+    from codex_feishu_bridge import __version__
+    package = tomllib.loads((root / "codex-feishu-bridge/pyproject.toml").read_text())["project"]
+    assert channel["bridge_version"] == package["version"] == __version__
     assert channel["codex_version"] == "0.170.0"

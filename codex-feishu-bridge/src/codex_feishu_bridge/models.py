@@ -71,6 +71,8 @@ class IncomingMessage:
     app_id: str | None = None
     sender_type: str = "user"
     attachments: list[Attachment] = field(default_factory=list)
+    parent_id: str | None = None
+    source_text: str | None = None
 
 
 @dataclass(slots=True)

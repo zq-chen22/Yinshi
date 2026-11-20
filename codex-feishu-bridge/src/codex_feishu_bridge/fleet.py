@@ -323,7 +323,9 @@ def activate(request_path: Path) -> int:
         atomic_json(marker, deployed)
         db = BridgeDB(updated.database_path)
         try:
-            if request.get("model_profiles"):
+            if request.get("preserve_runtime_settings") is True and policy_counts.get("model_profiles", {}).get("unchanged"):
+                notice = f"✅ 本机 Yinshi 飞书桥 {request['bridge_version']} 已实际加载（{sha[:12]}）。原有模型档位、权限和群绑定保持。可发「模型档位」查看各组，再用「C组默认」或「C组高级」切换当前对话。"
+            elif request.get("model_profiles"):
                 notice = f"✅ Yinshi 飞书桥{request['bridge_version']}已加载；双模型档位迁移已保存，正在进行原生兼容和口令验收。权限、历史、配对及群绑定保持。"
             elif request.get("preserve_runtime_settings") is True:
                 notice = f"✅ Yinshi 飞书桥部署完成\n版本 {request['bridge_version']} · {sha[:12]}\nCodex {request['codex_version']}\n各对话模型、思考强度、Fast、权限及全局偏好保持；历史、配对及群绑定已保留。"

@@ -75,6 +75,22 @@ CREATE TABLE IF NOT EXISTS thread_leases (
     updated_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS group_questions (
+    message_id TEXT PRIMARY KEY REFERENCES inbox_messages(message_id) ON DELETE CASCADE,
+    chat_id TEXT NOT NULL, role TEXT NOT NULL, created_ms INTEGER NOT NULL,
+    context_json TEXT NOT NULL, terminal_json TEXT
+);
+CREATE INDEX IF NOT EXISTS group_history ON group_questions(chat_id,role,created_ms);
+CREATE TABLE IF NOT EXISTS group_reply_sources (
+    remote_id TEXT NOT NULL, chat_id TEXT NOT NULL, role TEXT NOT NULL,
+    source_id TEXT NOT NULL REFERENCES inbox_messages(message_id) ON DELETE CASCADE,
+    PRIMARY KEY(remote_id,chat_id,role)
+);
+CREATE TABLE IF NOT EXISTS group_consults (
+    message_id TEXT NOT NULL REFERENCES group_questions(message_id) ON DELETE CASCADE,
+    model_group TEXT NOT NULL, result TEXT, PRIMARY KEY(message_id,model_group)
+);
+
 CREATE TABLE IF NOT EXISTS outbox_messages (
     outbox_key TEXT PRIMARY KEY,
     app_role TEXT NOT NULL,
@@ -436,6 +452,8 @@ class BridgeDB:
             "tenant_key": message.tenant_key,
             "app_id": message.app_id,
             "sender_type": message.sender_type,
+            "parent_id": message.parent_id,
+            "source_text": message.source_text,
             "attachments": [
                 {
                     "kind": item.kind,
@@ -1066,6 +1084,75 @@ class BridgeDB:
             ).fetchone()
         return str(row["message_id"]) if row else None
 
+    def save_question(self, message: IncomingMessage, context: dict) -> dict:
+        with self._lock, self._conn:
+            self._conn.execute("INSERT OR IGNORE INTO group_questions VALUES(?,?,?,?,?,NULL)",
+                               (message.message_id,message.chat_id,message.app_role,
+                                message.create_time_ms,json.dumps(context,ensure_ascii=False)))
+        return self.group_question(message.message_id, message.chat_id, message.app_role) or context
+
+    def group_question(self, message_id: str, chat: str, role: str, *, previous=False) -> dict | None:
+        with self._lock:
+            if previous:
+                row = self._conn.execute(
+                    """SELECT context_json FROM group_questions WHERE chat_id=? AND role=?
+                       AND rowid < (SELECT rowid FROM group_questions WHERE message_id=? AND chat_id=? AND role=?)
+                       AND NOT EXISTS (SELECT 1 FROM group_consults c WHERE c.message_id=group_questions.message_id)
+                       ORDER BY rowid DESC LIMIT 1""", (chat,role,message_id,chat,role)).fetchone()
+            else:
+                row = self._conn.execute("SELECT context_json FROM group_questions WHERE message_id=? AND chat_id=? AND role=?",
+                                         (message_id,chat,role)).fetchone()
+            return json.loads(row[0]) if row else None
+
+    def claude_terminal(self, message_id: str, terminal: dict | None = None) -> dict | None:
+        with self._lock, self._conn:
+            if terminal is not None:
+                self._conn.execute("UPDATE group_questions SET terminal_json=COALESCE(terminal_json,?) WHERE message_id=?",
+                                   (json.dumps(terminal,ensure_ascii=False),message_id))
+            row = self._conn.execute("SELECT terminal_json FROM group_questions WHERE message_id=?", (message_id,)).fetchone()
+            return json.loads(row[0]) if row and row[0] else None
+
+    def link_reply_source(self, remote_id: str, source: str, chat: str, role: str):
+        with self._lock, self._conn:
+            self._conn.execute("""INSERT OR IGNORE INTO group_reply_sources
+                SELECT ?,chat_id,app_role,message_id FROM inbox_messages
+                WHERE message_id=? AND chat_id=? AND app_role=?""",(remote_id,source,chat,role))
+
+    def referenced_question(self, mid: str, chat: str, role: str, *, previous=False):
+        with self._lock:
+            if not previous:
+                row = self._conn.execute("""SELECT source_id FROM group_reply_sources WHERE remote_id=? AND chat_id=? AND role=?
+                       UNION ALL SELECT message_id FROM turn_jobs WHERE progress_message_id=? AND chat_id=? AND app_role=? LIMIT 1""",
+                       (mid,chat,role,mid,chat,role)).fetchone()
+                if row: mid=row[0]
+        q = self.group_question(mid,chat,role,previous=previous)
+        if q: return q
+        # Older bindings already have durable Feishu source messages. Never
+        # infer a cross-chat reference or silently omit historical attachments.
+        with self._lock:
+            match = ("i.rowid < (SELECT rowid FROM inbox_messages WHERE message_id=? AND chat_id=? AND app_role=?)"
+                     if previous else "i.message_id=? AND i.chat_id=? AND i.app_role=?")
+            row = self._conn.execute(f"""SELECT i.payload_json FROM inbox_messages i JOIN turn_jobs j USING(message_id)
+                WHERE i.chat_id=? AND i.app_role=? AND {match}
+                AND NOT EXISTS(SELECT 1 FROM group_consults c WHERE c.message_id=i.message_id)
+                ORDER BY i.rowid DESC LIMIT 1""",(chat,role,mid,chat,role)).fetchone()
+        if row:
+            data=json.loads(row[0])
+            if data.get("attachments"): raise ValueError("历史附件缺少已经验证的代理，请重新引用并附上文件")
+            return {"text":data.get("source_text") if data.get("source_text") is not None else data["text"],"images":[],"files":[]}
+        return None
+
+    def claim_consult(self, mid: str, group: str) -> tuple[bool, str | None]:
+        with self._lock, self._conn:
+            cur = self._conn.execute("INSERT OR IGNORE INTO group_consults VALUES(?,?,NULL)", (mid,group))
+            row = self._conn.execute("SELECT result FROM group_consults WHERE message_id=? AND model_group=?", (mid,group)).fetchone()
+            return bool(cur.rowcount), row[0]
+
+    def finish_consult(self, mid: str, group: str, result: str) -> None:
+        with self._lock, self._conn:
+            self._conn.execute("UPDATE group_consults SET result=? WHERE message_id=? AND model_group=? AND result IS NULL",
+                               (result,mid,group))
+
     def list_recoverable_turn_jobs(self) -> list[TurnJob]:
         with self._lock:
             rows = self._conn.execute(
@@ -1377,5 +1464,7 @@ class BridgeDB:
             tenant_key=raw.get("tenant_key"),
             app_id=raw.get("app_id"),
             sender_type=raw.get("sender_type", "user"),
+            parent_id=raw.get("parent_id"),
+            source_text=raw.get("source_text"),
             attachments=attachments,
         )

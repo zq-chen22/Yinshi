@@ -632,6 +632,7 @@ def _normalize_message(data: Any, role: AppRole, expected_app_id: str) -> Incomi
         key = getattr(mention, "key", None)
         if key:
             text = text.replace(str(key), "")
+    source_text = text
     text = text.strip()
     return IncomingMessage(
         message_id=str(message.message_id),
@@ -647,6 +648,8 @@ def _normalize_message(data: Any, role: AppRole, expected_app_id: str) -> Incomi
         tenant_key=str(header.tenant_key or sender.tenant_key or ""),
         app_id=str(header.app_id or expected_app_id),
         sender_type=str(sender.sender_type or ""),
+        parent_id=getattr(message, "parent_id", None),
+        source_text=source_text,
         attachments=attachments,
     )
 
@@ -751,6 +754,8 @@ def _normalize_history_message(item: Any, role: AppRole, app_id: str) -> Incomin
         tenant_key=str(getattr(sender, "tenant_key", "") or ""),
         app_id=app_id,
         sender_type=str(getattr(sender, "sender_type", "system") or "system"),
+        parent_id=getattr(item, "parent_id", None),
+        source_text=text,
         attachments=attachments,
     )
 

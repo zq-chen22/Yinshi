@@ -14,6 +14,8 @@
 
 ## 我们的功能
 
+在启用多模型组的主机，可用同一个飞书机器人切换 Codex / Claude Code，或请两方独立回答同一问题。见[口令、共享日志与交叉印证](../docs/13-model-groups.md)。
+
 <p>
 <strong>01 / 不同设备</strong>&ensp;在飞书里协调不同设备上的 Codex<br>
 <strong>02 / 状态同步</strong>&ensp;飞书任务中的思考状态、进展与计划，可通过飞书卡片及时同步<br>

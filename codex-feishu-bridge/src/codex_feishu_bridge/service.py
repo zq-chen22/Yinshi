@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Any
 
 from .account_status import AccountQuotaStatus
+from .group_service import GroupService
+from .claude_runner import content_blocks
 from .artifacts import ArtifactBroker
 from .codex_client import (
     CodexAppServer,
@@ -85,7 +87,7 @@ def generate_pairing_code(db: BridgeDB, ttl_seconds: int) -> tuple[str, int]:
     return code, expires_at
 
 
-class BridgeService:
+class BridgeService(GroupService):
     def __init__(
         self,
         config: BridgeConfig,
@@ -97,6 +99,7 @@ class BridgeService:
         self.db = db
         self.codex = codex
         self.gateway = gateway
+        self._init_groups()
         self._account_quota = AccountQuotaStatus(
             lambda: self.codex.read_rate_limits(), timezone_name=config.daily_stats.timezone
         )
@@ -146,15 +149,9 @@ class BridgeService:
     async def start(self) -> None:
         ambiguous = self.db.recover_inbox_after_restart()
         recovered_outbox = self.db.recover_outbox_after_restart()
-        await self.codex.start()
-        await self._probe_runtime_settings_compatibility()
-        await self._recover_turn_jobs(startup=True)
+        self._codex_online = False
         self.gateway.start_receivers()
-        await self.reconcile_once()
-        try:
-            await self._backfill_once()
-        except Exception:
-            LOG.exception("Initial Feishu history recovery failed")
+        await self._recover_turn_jobs(startup=True)
         self._tasks = [
             self._critical_task(self._inbox_loop(), "feishu-inbox"),
             self._critical_task(self._reconcile_loop(), "thread-reconciler"),
@@ -174,6 +171,13 @@ class BridgeService:
             )
         if recovered_outbox:
             LOG.warning("Recovered %d interrupted Feishu outbox send(s)", recovered_outbox)
+        self._background_task(self._initial_history_recovery(), "initial-history-recovery")
+
+    async def _initial_history_recovery(self):
+        try:
+            await self._backfill_once()
+        except Exception:
+            LOG.exception("Initial Feishu history recovery failed")
 
     async def run_forever(self) -> None:
         await self.start()
@@ -580,7 +584,7 @@ class BridgeService:
     async def _reconcile_loop(self) -> None:
         while not self._stop.is_set():
             await asyncio.sleep(self.config.sync_interval_seconds)
-            if self._draining:
+            if self._draining or not self._codex_online:
                 continue
             try:
                 await self.reconcile_once()
@@ -588,10 +592,29 @@ class BridgeService:
                 LOG.exception("Thread reconciliation failed")
 
     async def _codex_watch_loop(self) -> None:
+        delay = 1
+        while not self._codex_online and not self._stop.is_set():
+            try:
+                await self.codex.start()
+                await self._probe_runtime_settings_compatibility()
+            except Exception:
+                LOG.warning("Codex unavailable; Feishu and Claude remain online")
+                with contextlib.suppress(Exception):
+                    await self.codex.close()
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 30)
+                continue
+            self._codex_online = True
+            await self._recover_turn_jobs(startup=True)
+            try:
+                await self.reconcile_once()
+            except Exception:
+                LOG.warning("Initial Codex reconciliation deferred", exc_info=True)
         while not self._stop.is_set():
             await self.codex.wait_closed()
             if self._stop.is_set():
                 return
+            self._codex_online = False
             await self._notify_admin(
                 "⚠️ Codex App Server 连接意外关闭，桥接器正在本机自动重启并核对活动任务。"
             )
@@ -600,6 +623,7 @@ class BridgeService:
                 try:
                     await self.codex.close()
                     await self.codex.start()
+                    self._codex_online = True
                     break
                 except Exception:
                     LOG.exception("Could not restart Codex app-server")
@@ -608,6 +632,8 @@ class BridgeService:
             if self._stop.is_set():
                 return
             for active in list(self._active_by_turn.values()):
+                if active.turn_id.startswith("cc:"):
+                    continue
                 try:
                     turn = await self._find_turn_summary(active.thread_id, active.turn_id)
                     if turn and turn.get("status") in {"completed", "failed", "interrupted"}:
@@ -623,6 +649,11 @@ class BridgeService:
 
     async def _recover_turn_jobs(self, *, startup: bool = False) -> None:
         for job in self.db.list_recoverable_turn_jobs():
+            if job.turn_id.startswith("cc:"):
+                await self._recover_claude(job)
+                continue
+            if not self._codex_online:
+                continue
             age = max(0, int(time.time()) - job.created_at) if job.created_at else 0
             candidate = ActiveTurn(
                 thread_id=job.thread_id,
@@ -776,6 +807,8 @@ class BridgeService:
         """Recover a terminal event lost while the App Server stayed connected."""
 
         turn_id = active.turn_id
+        if turn_id.startswith("cc:") or turn_id in self._consult_tasks:
+            return
         if turn_id in self._auditing_turns:
             return
         self._auditing_turns.add(turn_id)
@@ -928,7 +961,7 @@ class BridgeService:
                         dict(item.content["card"]),
                     )
                 elif item.msg_type == "text":
-                    await self.gateway.send_text(
+                    remote_id = await self.gateway.send_text(
                         item.app_role,
                         item.receive_id,
                         str(item.content.get("text") or ""),
@@ -936,6 +969,8 @@ class BridgeService:
                         idempotency_key=item.outbox_key,
                         reply_to_message_id=item.reply_to_message_id,
                     )
+                    if isinstance(remote_id,str) and remote_id and item.reply_to_message_id and item.receive_id_type == "chat_id":
+                        self.db.link_reply_source(remote_id,item.reply_to_message_id,item.receive_id,item.app_role)
                 else:
                     await self.gateway.send_message(
                         item.app_role,
@@ -1673,7 +1708,7 @@ class BridgeService:
             )
             self.db.set_turn_job_state(active.turn_id, "abandoned")
             try:
-                await self.codex.interrupt_turn(active.thread_id, active.turn_id)
+                await self._interrupt_engine(active)
             except Exception:
                 self.db.compare_and_set_turn_job_state(
                     active.turn_id,
@@ -1792,7 +1827,7 @@ class BridgeService:
             await self._patch_controlled_job(
                 job,
                 title="已追加到当前任务",
-                text="这条等待信息已通过 Codex 的引导输入送入当前执行。",
+                text="这条等待信息已作为引导输入送入当前执行。",
                 color="blue",
             )
 
@@ -1867,7 +1902,7 @@ class BridgeService:
         if text == "!stop":
             active = self._active_by_thread.get(binding.thread_id)
             if active:
-                await self.codex.interrupt_turn(binding.thread_id, active.turn_id)
+                await self._interrupt_engine(active)
                 reply = "已请求停止当前执行；队列中的后续消息不会被清空。"
             else:
                 reply = "当前没有由飞书桥启动的活动执行。"
@@ -1901,7 +1936,7 @@ class BridgeService:
 
     async def _try_model_profile_command(self, item: InboxItem) -> bool:
         message = item.message
-        parsed = profile_command(message.text.strip())
+        parsed = profile_command(message.text.strip(), tuple(self.groups))
         if parsed is None:
             return False
         command, argument = parsed
@@ -1923,11 +1958,29 @@ class BridgeService:
                     f"• {PROFILE_LABELS[level]}：{profiles[level].model} / {profiles[level].effort}"
                     if level in profiles else f"• {PROFILE_LABELS[level]}：未设置"
                     for level in PROFILE_LABELS
-                ) + "\n口令：默认、高级、全部默认、全部高级。新对话默认；Random始终高级+Fast。"
+                ) + "\nCodex 口令：默认、高级、全部默认、全部高级。新对话默认；Codex 组内 Random 固定高级+Fast。"
+                for group, catalog in self.groups.items():
+                    name = group.upper()+"组"
+                    reply += "\n"+name+"："+ "；".join(f"{name}{PROFILE_LABELS[k]} {v.model} / {v.effort}" for k,v in catalog.items())
+                reply += "\n当前主组："+self._group_description(scope)
             else:
                 global_command = command.startswith("全部") or command.endswith("模型")
                 if global_command and message.sender_open_id != self._owner(message.app_role):
                     raise ValueError("全局档位设置和全部切换仅允许已配对的桥管理员操作。")
+                if "组" in command:
+                    group = command.removeprefix("全部").split("组",1)[0].casefold()
+                    if not self.claude.available():
+                        raise ValueError("此机尚无可用 Claude 客户端或本机私有令牌；未切换。")
+                    level = "default" if command.endswith("默认") else "advanced"
+                    scopes = ([entry.thread_id for entry in self.db.list_bindings() if entry.active and entry.chat_id]+["admin"]
+                              if global_command else [scope])
+                    chosen = self.groups[group][level]
+                    reply = f"已保存 {command}：{chosen.model} / {chosen.effort}；{len(scopes)} 个对话设置，下一项任务生效。未打断在途任务。"
+                    changes = [(s,k,v) for s in scopes for k,v in (("model_group",group),("group_level",level))]
+                    self.db.set_runtime_configs([*changes,("model_profile_commands",message.message_id,reply)],message_id=message.message_id)
+                    await self.gateway.send_text(message.app_role,message.chat_id,reply,idempotency_key=f"model-profile:{message.message_id}",reply_to_message_id=message.message_id)
+                    self.db.complete_incoming(message.message_id)
+                    return True
                 if self._runtime_compatibility_error:
                     raise ValueError("设置兼容门禁尚未通过，请先发送/compat检测并修复；本次未修改。")
                 models = await self.codex.list_models()
@@ -1957,6 +2010,7 @@ class BridgeService:
                         preset = profiles[target_level]
                         validate_profile(f"{preset.model} {preset.effort}", models, advanced=target_level == "advanced")
                         changes.extend(profile_changes(target, title, target_level, profiles))
+                        changes.append((target,"model_group","codex"))
                     reply = f"已保存{command}设置；普通对话Fast关闭，Random固定高级+Fast。"
                 changes.append(("model_profile_commands", message.message_id, reply))
                 self.db.set_runtime_configs(changes, message_id=message.message_id)
@@ -2014,6 +2068,12 @@ class BridgeService:
         scope = binding.thread_id if binding else "admin"
         argument = argument.strip()
         card: dict[str, Any] | None = None
+        if self._group(scope) != "codex" and kind not in {"配置记录","设置记录"}:
+            reply = ("当前主模型："+self._group_description(scope)+"。独立走 Claude Code / 4Router。"
+                     "发送 模型档位 查询；发送 默认 或 高级 切回 Codex。未修改权限或 Codex 配置。")
+            await self.gateway.send_text(message.app_role,message.chat_id,reply,idempotency_key=f"group-status:{message.message_id}",reply_to_message_id=message.message_id)
+            self.db.complete_incoming(message.message_id)
+            return True
 
         if profile_for_scope(self.db, scope, binding.title if binding else "") is not None and not (binding and "random" in binding.title.casefold()) and (
             kind == "快速" or (kind == "速度" and argument.casefold() in {"快速", "fast", "priority", "on"})
@@ -2610,6 +2670,8 @@ class BridgeService:
                 await self.codex.unsubscribe_thread(thread_id)
 
     async def _apply_runtime_if_idle(self, binding: Binding | None, scope: str) -> bool:
+        if self._group(scope) != "codex":
+            return False
         if not binding:
             return True
         if binding.thread_id in self._active_by_thread:
@@ -2652,6 +2714,28 @@ class BridgeService:
         queue_on_terminal: bool = True,
     ) -> bool:
         message = item.message
+        if active.turn_id.startswith("cc:"):
+            inputs = await self.artifacts.prepare_inputs(message)
+            orig = self.db.turn_job_message_id(active.turn_id)
+            if orig:
+                original_outbox = self.config.outbox_dir/hashlib.sha256(orig.encode()).hexdigest()[:20]
+                inputs = [i for i in inputs if not (i.get("type")=="text" and i.get("text","").startswith("飞书桥交付约束："))]
+                inputs.append({"type":"text","text":f"追加信息仍属于同一任务。最终交付目录为 {original_outbox}"})
+            blocks = content_blocks(inputs,self.config.visual_proxy_dir)
+            mounts = [self.artifacts._validate_staged(Path(a.local_path)) for a in message.attachments if a.kind!="image" and a.local_path]
+            run = self.claude.running.get(active.turn_id)
+            if run and self.db.mark_incoming_dispatching(message.message_id):
+                if run.steer(blocks,mounts):
+                    self.db.complete_incoming(message.message_id)
+                    if acknowledge:
+                        await self.gateway.send_text(message.app_role,message.chat_id,"↪️ 已请求立即引导当前 Claude 任务：停止旧生成，在同一会话处理补充。",idempotency_key=f"steered:{message.message_id}",reply_to_message_id=message.message_id)
+                    return True
+                self.db.fail_incoming(message.message_id,"Claude 已结束，重新排队",retry_after_seconds=0)
+            elif not run and queue_on_terminal:
+                binding=self.db.get_binding_by_chat(message.chat_id)
+                if binding and message.chat_type!="p2p": await self._queue_thread_message(item,binding)
+                else: await self._queue_admin_message(item)
+            return False
         try:
             persisted_turn = await self._find_turn_summary(active.thread_id, active.turn_id)
             if persisted_turn and persisted_turn.get("status") in {
@@ -2715,14 +2799,14 @@ class BridgeService:
         queue = self._thread_queues.setdefault(binding.thread_id, asyncio.Queue())
         position = queue.qsize() + (1 if self._current_active_turn(binding.thread_id) else 0)
         text = (
-            "已收到，正在启动 Codex。" if position == 0 else f"已收到，前面还有 {position} 条消息。"
+            f"已收到，正在启动 {self._group_description(binding.thread_id)}。" if position == 0 else f"已收到，前面还有 {position} 条消息。"
         )
         self.db.mark_incoming_queued(item.message.message_id)
         progress_id = await self.gateway.send_card(
             "conversation",
             item.message.chat_id,
             progress_card(
-                "Codex 已接单",
+                self._group_description(binding.thread_id)+" 已接单",
                 text
                 + "\n\n执行中可发送 `!steer 补充要求`；单独发送 `追加信息` "
                 "会把等待消息并入当前轮，发送 `停止任务` 会中断并清空等待队列。",
@@ -2794,7 +2878,13 @@ class BridgeService:
             await done.wait()
         if self.db.inbox_state(message.message_id) not in {"processing", "queued"}:
             return
+        if self._group(thread_id) != "codex":
+            await self._execute_claude(thread_id,job)
+            return
         if not await self._wait_thread_available(thread_id, job):
+            return
+        if self._group(thread_id) != "codex":
+            await self._execute_claude(thread_id,job)
             return
         if self.db.inbox_state(message.message_id) not in {"processing", "queued"}:
             return
@@ -2805,6 +2895,7 @@ class BridgeService:
         try:
             runtime = self._runtime_settings(thread_id)
             inputs = await self.artifacts.prepare_inputs(message)
+            _,inputs = self._question_inputs(job,thread_id,inputs)
             if not self.db.mark_incoming_dispatching(message.message_id):
                 return
             self._pending_jobs[thread_id] = job
@@ -2886,6 +2977,8 @@ class BridgeService:
                 "queued",
             }:
                 return False
+            if self._group(thread_id) != "codex":
+                return True
             blocked_turn = self.db.get_setting(f"blocked_thread:{thread_id}", "") or ""
             if blocked_turn:
                 notice = f"thread 已安全锁定，等待管理员核对并解除：`{blocked_turn}`"
@@ -3148,7 +3241,7 @@ class BridgeService:
         progress_id = await self.gateway.send_card(
             message.app_role,
             message.chat_id,
-            progress_card("私聊临时对话", "已收到，正在用一个不保留上下文的 Codex 对话处理。"),
+            progress_card("私聊临时对话", "已收到，正在用不保留上下文的 "+self._group_description("admin")+" 对话处理。"),
             idempotency_key=f"admin-progress:{message.message_id}",
             reply_to_message_id=message.message_id,
         )
@@ -3169,6 +3262,9 @@ class BridgeService:
             thread_id: str | None = None
             message = job.inbox.message
             try:
+                if self._group("admin") != "codex":
+                    await self._execute_claude("admin",job)
+                    continue
                 runtime = self._runtime_settings("admin")
                 # Creating even the context-free helper thread is an
                 # irreversible RPC.  Cross the durable ambiguity boundary
@@ -3189,6 +3285,7 @@ class BridgeService:
                     thread_id, f"飞行桥临时任务-{message.message_id[-8:]}"
                 )
                 inputs = await self.artifacts.prepare_inputs(message)
+                _,inputs = self._question_inputs(job,"admin",inputs)
                 self._pending_jobs[thread_id] = job
                 turn = await self.codex.start_turn(
                     thread_id,
@@ -3324,7 +3421,7 @@ class BridgeService:
                 try:
                     patched = await self._patch_active_progress(
                         active,
-                        progress_card("Codex 执行中", rendered),
+                        progress_card(("Claude" if active.turn_id.startswith("cc:") else "Codex")+" 执行中", rendered),
                         terminal=False,
                     )
                     if patched:
@@ -3395,7 +3492,7 @@ class BridgeService:
             lines.extend(
                 [
                     "",
-                    f"⚠️ Codex 已 {quiet_display // 60} 分 {quiet_display % 60} 秒"
+                    f"⚠️ 执行器已 {quiet_display // 60} 分 {quiet_display % 60} 秒"
                     "没有产生新事件；桥仍保持连接，未把等待误报为新进展。",
                 ]
             )
@@ -3523,7 +3620,7 @@ class BridgeService:
                     started_monotonic=time.monotonic(),
                 )
                 self._register_active(active)
-                await self._finalize_turn(active, turn_raw)
+                await self._notification_final(active, turn_raw)
             else:
                 recovery = self._pending_recoveries.get(thread_id)
                 if recovery:
@@ -3547,7 +3644,7 @@ class BridgeService:
                             state="running",
                         )
                     )
-                    await self._finalize_turn(active, turn_raw)
+                    await self._notification_final(active, turn_raw)
             return
         if not active:
             return
@@ -3614,7 +3711,17 @@ class BridgeService:
             elif item_type == "contextCompaction":
                 active.current_operation = "上下文压缩完成"
         elif method == "turn/completed":
-            await self._finalize_turn(active, turn_raw)
+            await self._notification_final(active, turn_raw)
+
+    async def _notification_final(self, active: ActiveTurn, turn: dict[str, Any]) -> None:
+        _, final = extract_agent_messages(turn)
+        value = final[-1] if final else active.final_text
+        if value and value.lstrip().startswith("{") and '"yinshi_consult"' in value:
+            # A blind consultation may run for minutes. The app-server receiver
+            # must keep reading progress and completions for unrelated chats.
+            self._background_task(self._finalize_turn(active,turn), "model-group-final")
+        else:
+            await self._finalize_turn(active,turn)
 
     async def _finalize_turn(self, active: ActiveTurn, turn: dict[str, Any]) -> None:
         if active.turn_id in self._finalizing or active.turn_id in self._completed_turns:
@@ -3628,17 +3735,23 @@ class BridgeService:
             elif not active.final_text and commentary:
                 active.final_text = commentary[-1]
             status = str(turn.get("status") or "completed")
+            label = "Claude" if active.turn_id.startswith("cc:") else "Codex"
             if not active.final_text:
                 error = turn.get("error") or {}
-                active.final_text = f"Codex 执行状态：{status}。" + (
+                active.final_text = f"{label} 执行状态：{status}。" + (
                     f"\n错误：{error.get('message', error)}" if error else ""
                 )
+            try:
+                delegated = await self._group_final(active,status)
+            except (OSError,ValueError,KeyError) as exc:
+                active.final_text = "跨组请求未完成："+redact_log(exc)
+                status,delegated = "failed",True
             color = (
                 "green" if status == "completed" else "orange" if status == "interrupted" else "red"
             )
             if active.progress_message_id:
                 terminal_card = progress_card(
-                    "Codex 已完成" if status == "completed" else f"Codex：{status}",
+                    label+" 已完成" if status == "completed" else f"{label}：{status}",
                     self._render_progress(active),
                     color=color,
                 )
@@ -3669,13 +3782,17 @@ class BridgeService:
                             sequence=0,
                         )
                     )
-            safe_final = _redact(active.final_text)
-            generated_paths = self.artifacts.generated_image_paths(active.artifact_paths)
+            safe_final = active.final_text if delegated else _redact(active.final_text)
+            generated_paths = [] if delegated else self.artifacts.generated_image_paths(active.artifact_paths)
             automatic_paths = [
                 path
                 for path in self.artifacts.outgoing_paths(active.final_text)
-                if path not in generated_paths
+                if not delegated and path not in generated_paths
             ]
+            if label == "Claude":
+                mid = self.db.turn_job_message_id(active.turn_id) or ""
+                owned = self.config.outbox_dir / hashlib.sha256(mid.encode()).hexdigest()[:20]
+                automatic_paths = [p for p in automatic_paths if p.resolve().is_relative_to(owned.resolve())]
             self._enqueue_outbound_result(
                 app_role=active.app_role,
                 chat_id=active.chat_id,
@@ -3686,7 +3803,7 @@ class BridgeService:
                 artifact_paths=[*generated_paths, *automatic_paths],
             )
             self.db.set_turn_job_state(active.turn_id, "completed")
-            if (
+            if label != "Claude" and (
                 active.app_role == "admin"
                 or self.db.get_setting(f"exclude_thread:{active.thread_id}", "") == "1"
             ):
@@ -4147,7 +4264,7 @@ class BridgeService:
                     return
                 self.db.set_turn_job_state(active.turn_id, "abandoned")
                 try:
-                    await self.codex.interrupt_turn(active.thread_id, active.turn_id)
+                    await self._interrupt_engine(active)
                 except Exception as error:
                     self.db.compare_and_set_turn_job_state(
                         active.turn_id,
@@ -4552,5 +4669,5 @@ def _split_utf8(text: str, max_bytes: int) -> list[str]:
         if split_at > 0:
             chunk = chunk[:split_at]
         parts.append(chunk)
-        remaining = remaining[len(chunk) :].lstrip("\n")
+        remaining = remaining[len(chunk) :]
     return parts

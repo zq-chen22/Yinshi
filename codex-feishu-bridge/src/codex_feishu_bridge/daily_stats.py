@@ -585,7 +585,7 @@ def _read_turn_jobs(
                       i.payload_json
                  FROM turn_jobs AS j
                  JOIN inbox_messages AS i USING(message_id)
-                WHERE j.created_at >= ? AND j.created_at < ?
+                WHERE j.created_at >= ? AND j.created_at < ? AND j.turn_id NOT LIKE 'cc:%'
                 ORDER BY j.created_at, j.turn_id""",
             (int(earliest.timestamp()), int(latest.timestamp())),
         ).fetchall()

@@ -106,7 +106,14 @@ def profile_for_scope(
     return (level, profiles[level]) if level in profiles else None
 
 
-def profile_command(text: str) -> tuple[str, str] | None:
+def profile_command(text: str, groups: tuple[str, ...] = ("c",)) -> tuple[str, str] | None:
+    # Whole-message commands only. Consultation is an agent action, not a keyword.
+    folded = text.strip().casefold()
+    for group in groups:
+        for prefix in ("", "全部"):
+            for label in PROFILE_LABELS.values():
+                if folded == f"{prefix}{group.casefold()}组{label}":
+                    return f"{prefix}{group.upper()}组{label}", ""
     if text in {"默认", "高级", "全部默认", "全部高级", "模型档位"}:
         return text, ""
     match = re.fullmatch(r"(默认模型|高级模型)\s+(.+)", text, re.DOTALL)
