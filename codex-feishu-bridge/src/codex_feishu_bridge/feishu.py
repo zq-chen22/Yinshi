@@ -665,8 +665,24 @@ def _normalize_card_action(
     if header.app_id and header.app_id != expected_app_id:
         raise ValueError("Feishu card app_id mismatch")
     value = action.value or {}
+    if not isinstance(value,dict):
+        return None
     kind = value.get("kind")
-    if kind == "codex_approval":
+    if kind == "bridge_model":
+        from .model_menu import ID, GROUP
+        if not getattr(context,"open_message_id",None) or not getattr(context,"open_chat_id",None):
+            return None
+        if value.get("action")=="page":
+            page=value.get("page")
+            if type(page) is not int or not 0<=page<=10000: return None
+            command=f"/bridge-model-menu page {page}"
+        elif value.get("action")=="pick":
+            group,model=value.get("group"),value.get("model")
+            if not isinstance(group,str) or not GROUP.fullmatch(group) or not isinstance(model,str) or not ID.fullmatch(model): return None
+            command=f"/bridge-model-menu pick {group} {model}"
+        else:
+            return None
+    elif kind == "codex_approval":
         short_id = str(value.get("short_id") or "")
         decision = str(value.get("decision") or "")
         if not short_id or decision not in {"allow_once", "deny", "cancel"}:
@@ -710,6 +726,7 @@ def _normalize_card_action(
     event_id = str(header.event_id or secrets.token_hex(16))
     return IncomingMessage(
         message_id=f"card:{event_id}",
+        parent_id=str(context.open_message_id) if kind=="bridge_model" else None,
         chat_id=str(context.open_chat_id or ""),
         chat_type="group",
         app_role=role,

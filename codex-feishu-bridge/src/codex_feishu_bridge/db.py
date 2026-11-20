@@ -86,6 +86,11 @@ CREATE TABLE IF NOT EXISTS group_reply_sources (
     source_id TEXT NOT NULL REFERENCES inbox_messages(message_id) ON DELETE CASCADE,
     PRIMARY KEY(remote_id,chat_id,role)
 );
+CREATE TABLE IF NOT EXISTS bridge_model_cards (
+    card_id TEXT PRIMARY KEY,
+    owner_message TEXT NOT NULL REFERENCES inbox_messages(message_id) ON DELETE CASCADE,
+    chat_id TEXT NOT NULL, role TEXT NOT NULL, scope TEXT NOT NULL, page INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS group_consults (
     message_id TEXT NOT NULL REFERENCES group_questions(message_id) ON DELETE CASCADE,
     model_group TEXT NOT NULL, result TEXT, PRIMARY KEY(message_id,model_group)
@@ -305,12 +310,15 @@ class BridgeDB:
         self.set_runtime_configs([(scope, name, value)], message_id=message_id)
 
     def set_runtime_configs(
-        self, changes: list[tuple[str, str, str]], *, message_id: str
-    ) -> None:
+        self, changes: list[tuple[str, str, str]], *, message_id: str, once_key: str | None = None
+    ) -> bool:
         now = int(time.time())
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
+                if once_key and self._conn.execute("SELECT 1 FROM settings WHERE key=?", (once_key,)).fetchone():
+                    self._conn.rollback()
+                    return False
                 for scope, name, value in changes:
                     key = f"runtime:{scope}:{name}"
                     row = self._conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
@@ -328,6 +336,7 @@ class BridgeDB:
                         (scope, name, old_value, value, message_id, now),
                     )
                 self._conn.commit()
+                return True
             except Exception:
                 self._conn.rollback()
                 raise
@@ -1111,6 +1120,22 @@ class BridgeDB:
                                    (json.dumps(terminal,ensure_ascii=False),message_id))
             row = self._conn.execute("SELECT terminal_json FROM group_questions WHERE message_id=?", (message_id,)).fetchone()
             return json.loads(row[0]) if row and row[0] else None
+
+    def remember_model_card(self, card_id, message, scope, page):
+        with self._lock, self._conn:
+            self._conn.execute("INSERT OR IGNORE INTO bridge_model_cards(card_id,owner_message,chat_id,role,scope,page) VALUES(?,?,?,?,?,?)",
+                (card_id,message.message_id,message.chat_id,message.app_role,scope,page))
+
+    def read_model_card(self, card_id, message):
+        with self._lock:
+            row=self._conn.execute("SELECT scope,page FROM bridge_model_cards WHERE card_id=? AND chat_id=? AND role=?",
+                                   (card_id,message.chat_id,message.app_role)).fetchone()
+            return (row[0],row[1]) if row else None
+
+    def model_card_page(self, card_id, message, page):
+        with self._lock, self._conn:
+            self._conn.execute("UPDATE bridge_model_cards SET page=? WHERE card_id=? AND chat_id=? AND role=?",
+                               (page,card_id,message.chat_id,message.app_role))
 
     def link_reply_source(self, remote_id: str, source: str, chat: str, role: str):
         with self._lock, self._conn:

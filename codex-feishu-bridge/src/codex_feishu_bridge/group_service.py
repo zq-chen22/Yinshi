@@ -36,6 +36,8 @@ class GroupService:
         self.claude = ClaudeBackend(self.config)
         self._codex_online = True
         self._consult_tasks = {}
+        self._picker_cache = {}
+        self._picker_locks = {}
 
     def _group(self, scope):
         return self.db.get_setting(f"runtime:{scope}:model_group", "codex")
@@ -43,27 +45,44 @@ class GroupService:
     def _group_level(self, scope):
         return self.db.get_setting(f"runtime:{scope}:group_level", "default")
 
+    def _claude_profile(self, scope):
+        group = self._group(scope)
+        base = self.groups[group][self._group_level(scope)]
+        model = self.db.get_setting(f"runtime:{scope}:group_model", "")
+        return ModelProfile(model, "") if model and group == "c" else base
+
     def _group_description(self, scope):
         group = self._group(scope)
         if group not in self.groups:
             return "Codex"
-        level = self._group_level(scope)
-        preset = self.groups[group][level]
-        return f"{group.upper()}组 · {preset.model} / {preset.effort}"
+        preset = self._claude_profile(scope)
+        return f"{group.upper()}组 · {preset.model} / {preset.effort or '模型默认'}"
 
-    def _question_inputs(self, job, scope, inputs):
-        m = job.inbox.message
+    def _question_model(self, job, scope, rt):
+        """Freeze the selected backend before asynchronous attachment preparation."""
         group = self._group(scope)
-        rt = self._runtime_settings(scope)
         if group == "codex":
             preset = profile_for_scope(
                 self.db, scope, job.binding.title if job.binding else ""
             )
-            level = preset[0] if preset else "default"
+            level = (
+                preset[0]
+                if preset
+                else self.db.get_setting(f"runtime:{scope}:picker_level", "default")
+            )
             model = rt.model or "Codex"
+            effort = rt.effort or ""
         else:
             level = self._group_level(scope)
-            model = self.groups[group][level].model
+            profile = self._claude_profile(scope)
+            model, effort = profile.model, profile.effort
+        return group, level, model, effort
+
+    def _question_inputs(self, job, scope, inputs, *, selected=None):
+        m = job.inbox.message
+        group, level, model, effort = selected or self._question_model(
+            job, scope, self._runtime_settings(scope)
+        )
         cwd = Path(job.binding.cwd) if job.binding else self.config.admin_scratch_dir
         owned = (
             self._allowed_workspace(cwd.resolve())
@@ -88,6 +107,7 @@ class GroupService:
                 group=group,
                 level=level,
                 model=model,
+                effort=effort,
                 temporary=not bool(job.binding),
                 text=m.source_text if m.source_text is not None else m.text,
                 parent=m.parent_id,
@@ -113,8 +133,10 @@ class GroupService:
         m = job.inbox.message
         if self.db.inbox_state(m.message_id) not in {"queued", "processing"}:
             return
+        rt = self._runtime_settings(scope)
+        selected = self._question_model(job, scope, rt)
         inputs = await self.artifacts.prepare_inputs(m)
-        ctx, inputs = self._question_inputs(job, scope, inputs)
+        ctx, inputs = self._question_inputs(job, scope, inputs, selected=selected)
         group, level = ctx["group"], ctx["level"]
         if group not in self.groups:
             raise ValueError("模型组已改变，请重试")
@@ -160,7 +182,6 @@ class GroupService:
             if job.binding:
                 self.db.set_setting(session_key, s)
 
-        rt = self._runtime_settings(scope)
         full = (
             rt.sandbox == "danger-full-access"
             and rt.approval_policy == "never"
@@ -179,7 +200,9 @@ class GroupService:
             blocks = content_blocks(inputs, self.config.visual_proxy_dir)
             result = await self.claude.run(
                 turn_id,
-                self.groups[group][level],
+                ModelProfile(
+                    ctx["model"], ctx.get("effort", self.groups[group][level].effort)
+                ),
                 blocks,
                 cwd=Path(ctx["cwd"]),
                 session=session,

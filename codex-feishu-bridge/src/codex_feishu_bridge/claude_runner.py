@@ -14,6 +14,8 @@ import stat
 import tempfile
 from pathlib import Path
 
+import httpx
+
 from .model_profiles import ModelProfile
 
 
@@ -115,6 +117,29 @@ class ClaudeBackend:
         self.binary = shutil.which("claude") or str(Path.home() / ".local/bin/claude")
         self.running: dict[str, ClaudeRun] = {}
 
+    async def list_models(self) -> list[str]:
+        """Metadata only, same fixed host as the native client. Never follow redirects."""
+        key = load_key(self.key_path)
+        async with httpx.AsyncClient(timeout=3.0, follow_redirects=False) as client:
+            response = await client.get(
+                "https://4router.net/v1/models",
+                headers={"Authorization": "Bearer " + key},
+            )
+            if response.status_code != 200:
+                raise ClaudeError("当前无法读取 C 组目录")
+            entries = response.json().get("data")
+            if not isinstance(entries, list):
+                raise ClaudeError("C 组目录格式无效")
+            return list(
+                dict.fromkeys(
+                    x["id"]
+                    for x in entries
+                    if isinstance(x, dict)
+                    and isinstance(x.get("id"), str)
+                    and re.fullmatch(r"claude-[a-z0-9-]{1,80}", x["id"])
+                )
+            )
+
     def available(self) -> bool:
         try:
             return bool(load_key(self.key_path)) and os.access(self.binary, os.X_OK)
@@ -184,8 +209,6 @@ class ClaudeBackend:
                         "--disable-slash-commands",
                         "--model",
                         preset.model,
-                        "--effort",
-                        preset.effort,
                         "--input-format",
                         "stream-json",
                         "--output-format",
@@ -193,6 +216,8 @@ class ClaudeBackend:
                         "--verbose",
                         "--include-partial-messages",
                     ]
+                    if preset.effort:
+                        args += ["--effort", preset.effort]
                     if persistent:
                         args += ["--resume" if resume else "--session-id", session]
                     elif resume:

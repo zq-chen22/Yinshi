@@ -2540,7 +2540,7 @@ async def test_status_is_readable_with_settings_gate_and_quota_failure(tmp_path:
         assert "private-provider-error" not in text
         assert not codex.started_threads
         await service._route_incoming(stage(db, incoming("model-still-gated", text="/model")))
-        assert "兼容门禁" in gateway.texts[-1]["text"]
+        assert "兼容门禁" in str(gateway.cards[-1]["card"])
         assert not codex.setting_updates
     finally:
         db.close()
@@ -2642,7 +2642,9 @@ async def test_runtime_commands_persist_audit_and_apply_to_codex(tmp_path: Path)
             "effort": "high",
             "service_tier": "priority",
         }
-        assert len(db.runtime_config_history("thread-1")) == 5
+        audit = db.runtime_config_history("thread-1",limit=30)
+        assert {x["name"] for x in audit} >= {"model_group","model","effort","approval_policy","sandbox","service_tier"}
+        assert {x["message_id"] for x in audit} == {"runtime-model","runtime-permission","runtime-speed"}
         assert "GPT" not in gateway.texts[-2]["text"] or "gpt-test" in gateway.texts[-2]["text"]
         assert "最近配置变更" in gateway.texts[-1]["text"]
         assert db.inbox_counts() == {"done": len(commands)}
@@ -2666,8 +2668,9 @@ async def test_cli_setting_commands_render_pickers_and_toggle_fast(tmp_path: Pat
             action for element in model_card["elements"] for action in element.get("actions", [])
         ]
         assert model_buttons[0]["value"] == {
-            "kind": "codex_setting",
-            "setting": "model",
+            "kind": "bridge_model",
+            "action": "pick",
+            "group": "codex",
             "model": "gpt-test",
         }
 

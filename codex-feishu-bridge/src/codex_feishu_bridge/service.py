@@ -15,6 +15,7 @@ from typing import Any
 
 from .account_status import AccountQuotaStatus
 from .group_service import GroupService
+from .picker_service import ModelPickerService
 from .claude_runner import content_blocks
 from .artifacts import ArtifactBroker
 from .codex_client import (
@@ -87,7 +88,7 @@ def generate_pairing_code(db: BridgeDB, ttl_seconds: int) -> tuple[str, int]:
     return code, expires_at
 
 
-class BridgeService(GroupService):
+class BridgeService(ModelPickerService, GroupService):
     def __init__(
         self,
         config: BridgeConfig,
@@ -1047,6 +1048,8 @@ class BridgeService(GroupService):
             return
         if await self._try_model_profile_command(item):
             return
+        if await self._try_bridge_menu(item):
+            return
         if await self._try_runtime_command(item):
             return
         if message.app_role == "admin" or message.chat_type == "p2p":
@@ -1976,7 +1979,7 @@ class BridgeService(GroupService):
                               if global_command else [scope])
                     chosen = self.groups[group][level]
                     reply = f"已保存 {command}：{chosen.model} / {chosen.effort}；{len(scopes)} 个对话设置，下一项任务生效。未打断在途任务。"
-                    changes = [(s,k,v) for s in scopes for k,v in (("model_group",group),("group_level",level))]
+                    changes = [(s,k,v) for s in scopes for k,v in (("model_group",group),("group_level",level),("group_model",""))]
                     self.db.set_runtime_configs([*changes,("model_profile_commands",message.message_id,reply)],message_id=message.message_id)
                     await self.gateway.send_text(message.app_role,message.chat_id,reply,idempotency_key=f"model-profile:{message.message_id}",reply_to_message_id=message.message_id)
                     self.db.complete_incoming(message.message_id)
@@ -2043,8 +2046,6 @@ class BridgeService(GroupService):
             "!帮助": "帮助",
             "!配置": "配置",
             "!设置": "设置",
-            "!模型": "模型",
-            "/model": "模型",
             "!速度": "速度",
             "/fast": "快速",
             "!推理": "推理",
@@ -2068,7 +2069,7 @@ class BridgeService(GroupService):
         scope = binding.thread_id if binding else "admin"
         argument = argument.strip()
         card: dict[str, Any] | None = None
-        if self._group(scope) != "codex" and kind not in {"配置记录","设置记录"}:
+        if self._group(scope) != "codex" and kind not in {"配置记录","设置记录","帮助"}:
             reply = ("当前主模型："+self._group_description(scope)+"。独立走 Claude Code / 4Router。"
                      "发送 模型档位 查询；发送 默认 或 高级 切回 Codex。未修改权限或 Codex 配置。")
             await self.gateway.send_text(message.app_role,message.chat_id,reply,idempotency_key=f"group-status:{message.message_id}",reply_to_message_id=message.message_id)
@@ -2110,8 +2111,8 @@ class BridgeService(GroupService):
 
         if kind == "帮助":
             reply = (
-                "与 Codex CLI 一致的设置命令：\n"
-                "• `/model`：选择模型及推理强度\n"
+                "飞书桥设置命令：\n"
+                "• `/model`：在全部已配置模型组间一键切换；查看更多可展开目录\n"
                 "• `/fast`：切换当前模型的 Fast 层级\n"
                 "• `/permissions`：选择权限预设\n"
                 "• `/status`：查看当前会话配置\n"
@@ -2139,68 +2140,6 @@ class BridgeService(GroupService):
                 self.db.set_runtime_configs(profile_changes(scope, binding.title if binding else "", "default", profiles), message_id=message.message_id)
             applied = await self._apply_runtime_if_idle(binding, scope)
             reply = "已重置为桥接默认配置。" + ("" if applied else " 当前任务结束后生效。")
-        elif kind == "模型":
-            models = await self.codex.list_models()
-            if not argument:
-                card = _model_picker_card(models, self._runtime_settings(scope).model)
-                reply = ""
-            else:
-                parts = argument.split()
-                requested_model = parts[0]
-                requested_effort = parts[1].lower() if len(parts) == 2 else None
-                if len(parts) > 2:
-                    requested_effort = "__invalid__"
-                selected = next(
-                    (
-                        model
-                        for model in models
-                        if requested_model
-                        in {str(model.get("model") or ""), str(model.get("id") or "")}
-                    ),
-                    None,
-                )
-                if not selected:
-                    reply = f"未找到模型 `{requested_model}`；发送 `/model` 查看可用项。"
-                else:
-                    value = str(selected.get("model") or selected.get("id"))
-                    efforts = _model_efforts(selected)
-                    if requested_effort == "default":
-                        requested_effort = ""
-                    if requested_effort is not None and requested_effort not in {"", *efforts}:
-                        reply = "该模型不支持这个推理强度；请重新发送 `/model` 选择。"
-                    else:
-                        self.db.set_runtime_config(
-                            scope, "model", value, message_id=message.message_id
-                        )
-                        previous_effort = self.db.get_setting(f"runtime:{scope}:effort", "") or ""
-                        if requested_effort is not None or previous_effort:
-                            self.db.set_runtime_config(
-                                scope,
-                                "effort",
-                                (
-                                    RUNTIME_MODEL_DEFAULT
-                                    if requested_effort == ""
-                                    else requested_effort or ""
-                                ),
-                                message_id=message.message_id,
-                            )
-                        if len(load_profiles(self.db)) == 2:
-                            self.db.set_runtime_config(scope, "model_profile", "", message_id=message.message_id)
-                        applied = await self._apply_runtime_if_idle(binding, scope)
-                        suffix = "" if applied else " 当前任务结束后生效。"
-                        if requested_effort is None and efforts:
-                            card = _reasoning_picker_card(
-                                value,
-                                efforts,
-                                str(selected.get("defaultReasoningEffort") or ""),
-                                suffix,
-                            )
-                            reply = ""
-                        else:
-                            effort_text = requested_effort or str(
-                                selected.get("defaultReasoningEffort") or "模型默认"
-                            )
-                            reply = f"模型已设为 `{value}`，推理强度为 `{effort_text}`。{suffix}"
         elif kind == "快速":
             if argument:
                 reply = "`/fast` 是切换命令，不接受参数；再次发送即可开关。"
@@ -2504,7 +2443,7 @@ class BridgeService(GroupService):
 
     async def _format_runtime_status(self, scope: str, binding: Binding | None) -> str:
         settings = self._runtime_settings(scope)
-        models = await self.codex.list_models()
+        models, _ = await self._picker_source("codex")
         selected = _selected_model(models, settings.model)
         model_name = settings.model or (
             str(selected.get("model") or selected.get("id")) if selected else "Codex 默认"
@@ -2519,14 +2458,14 @@ class BridgeService(GroupService):
         profile = profile_for_scope(self.db, scope, binding.title if binding else "")
         profile_text = f"• 模型档位：{PROFILE_LABELS[profile[0]] if profile else '自定义'}\n" if len(load_profiles(self.db)) == 2 else ""
         return (
-            f"{target}状态：\n{profile_text}"
+            f"{target}状态：\n• 主组：Codex\n{profile_text}"
             f"• Codex CLI：`{version}`\n"
             f"• 模型：`{model_name}`\n"
             f"• 推理：`{effort}`\n"
             f"• Fast：`{'on' if settings.service_tier == 'priority' else 'off'}`\n"
             f"• 权限：`{permission}`\n"
             f"• 工作目录：`{cwd}`\n\n"
-            + await self._account_quota.render()
+            + (await self._account_quota.render() if self._codex_online else "Codex 当前未连接，余额未知。")
         )
 
     async def _probe_runtime_settings_compatibility(
@@ -2674,7 +2613,10 @@ class BridgeService(GroupService):
             return False
         if not binding:
             return True
-        if binding.thread_id in self._active_by_thread:
+        if any(binding.thread_id in jobs for jobs in (
+            self._active_by_thread, self._thread_worker_jobs,
+            self._pending_jobs, self._pending_recoveries,
+        )):
             return False
         settings = self._runtime_settings(scope)
         try:
@@ -2894,8 +2836,9 @@ class BridgeService(GroupService):
             return
         try:
             runtime = self._runtime_settings(thread_id)
+            selected = self._question_model(job, thread_id, runtime)
             inputs = await self.artifacts.prepare_inputs(message)
-            _,inputs = self._question_inputs(job,thread_id,inputs)
+            _, inputs = self._question_inputs(job, thread_id, inputs, selected=selected)
             if not self.db.mark_incoming_dispatching(message.message_id):
                 return
             self._pending_jobs[thread_id] = job
@@ -3266,6 +3209,7 @@ class BridgeService(GroupService):
                     await self._execute_claude("admin",job)
                     continue
                 runtime = self._runtime_settings("admin")
+                selected = self._question_model(job, "admin", runtime)
                 # Creating even the context-free helper thread is an
                 # irreversible RPC.  Cross the durable ambiguity boundary
                 # before calling it so a restart cannot create duplicates.
@@ -3285,7 +3229,7 @@ class BridgeService(GroupService):
                     thread_id, f"飞行桥临时任务-{message.message_id[-8:]}"
                 )
                 inputs = await self.artifacts.prepare_inputs(message)
-                _,inputs = self._question_inputs(job,"admin",inputs)
+                _, inputs = self._question_inputs(job, "admin", inputs, selected=selected)
                 self._pending_jobs[thread_id] = job
                 turn = await self.codex.start_turn(
                     thread_id,
@@ -4455,72 +4399,6 @@ def _compatibility_repair_card(version: str, baseline: str, error: str) -> dict[
                 ],
             },
         ],
-    }
-
-
-def _model_picker_card(models: list[dict[str, Any]], selected_id: str | None) -> dict[str, Any]:
-    selected = _selected_model(models, selected_id)
-    elements: list[dict[str, Any]] = [
-        {
-            "tag": "markdown",
-            "content": "与 Codex CLI 的 `/model` 选择器一致；选中模型后继续选择推理强度。",
-        }
-    ]
-    for model in models[:12]:
-        model_id = str(model.get("model") or model.get("id") or "")
-        if not model_id:
-            continue
-        name = str(model.get("displayName") or model_id)
-        default_effort = str(model.get("defaultReasoningEffort") or "default")
-        fast = any(
-            str(tier.get("id") or "") == "priority" for tier in model.get("serviceTiers") or []
-        )
-        suffix = f" · {default_effort}" + (" · Fast" if fast else "")
-        elements.append(
-            _setting_button(
-                f"{name}{suffix}",
-                {"setting": "model", "model": model_id},
-                selected=model is selected,
-            )
-        )
-    return {
-        "config": {"wide_screen_mode": True, "update_multi": True},
-        "header": {
-            "template": "blue",
-            "title": {"tag": "plain_text", "content": "Choose model"},
-        },
-        "elements": elements,
-    }
-
-
-def _reasoning_picker_card(
-    model_id: str, efforts: list[str], default_effort: str, suffix: str
-) -> dict[str, Any]:
-    elements: list[dict[str, Any]] = [
-        {
-            "tag": "markdown",
-            "content": (f"模型已选择 `{model_id}`。请选择 reasoning effort。" + suffix),
-        },
-        _setting_button(
-            f"Model default ({default_effort or 'default'})",
-            {"setting": "model", "model": model_id, "effort": "default"},
-        ),
-    ]
-    elements.extend(
-        _setting_button(
-            effort,
-            {"setting": "model", "model": model_id, "effort": effort},
-            selected=effort == default_effort,
-        )
-        for effort in efforts
-    )
-    return {
-        "config": {"wide_screen_mode": True, "update_multi": True},
-        "header": {
-            "template": "blue",
-            "title": {"tag": "plain_text", "content": "Choose reasoning effort"},
-        },
-        "elements": elements,
     }
 
 

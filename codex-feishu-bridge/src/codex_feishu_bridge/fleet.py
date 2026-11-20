@@ -324,7 +324,7 @@ def activate(request_path: Path) -> int:
         db = BridgeDB(updated.database_path)
         try:
             if request.get("preserve_runtime_settings") is True and policy_counts.get("model_profiles", {}).get("unchanged"):
-                notice = f"✅ 本机 Yinshi 飞书桥 {request['bridge_version']} 已实际加载（{sha[:12]}）。原有模型档位、权限和群绑定保持。可发「模型档位」查看各组，再用「C组默认」或「C组高级」切换当前对话。"
+                notice = f"✅ 本机 Yinshi 飞书桥 {request['bridge_version']} 已实际加载（{sha[:12]}）。原有模型档位、权限和群绑定保持。发送 /model 打开跨组选择卡，或用 /status 核对实际设置。"
             elif request.get("model_profiles"):
                 notice = f"✅ Yinshi 飞书桥{request['bridge_version']}已加载；双模型档位迁移已保存，正在进行原生兼容和口令验收。权限、历史、配对及群绑定保持。"
             elif request.get("preserve_runtime_settings") is True:
