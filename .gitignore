@@ -10,6 +10,25 @@
 **/secrets.env
 **/credentials.env
 **/.env
+# Host-owned Claude/Feishu credentials, private inventories and runtime state.
+*.key
+*.pem
+*.p12
+*.pfx
+.env.*
+!.env.example
+*.env
+auth.json
+fleet.json
+fleet.local.json
+deployment.json
+deployment-request.json
+fleet-ops/
+fleet-artifacts/
+visual-proxies/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
 
 # Runtime state and user-delivered artifacts
 **/*.sqlite

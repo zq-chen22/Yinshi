@@ -67,3 +67,5 @@ Codex-实验服务器01
 Yinshi 是唯一维护入口。生产实例使用固定 release tag / Git SHA、独立 venv 和本机配置，
 通过 SSH 分发验证过的产物，等待任务及发送队列空闲后再切换，不复制主机状态。
 版本、CLI、模型策略和节点同步流程见 [多主机发布与无损迁移](docs/12-fleet-releases.md)。
+
+主机之间无法 SSH 时，可各自从同一个 GitHub 仓库协作：[取得并验证当前候选（不重启服务）](docs/14-github-handoff.md)。默认分支含 [Codex / Claude 模型组和跨组菜单](docs/13-model-groups.md)。
